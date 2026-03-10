@@ -24,4 +24,6 @@ venv/
 
 # Output
 factory_out*/
+runs/
 run_*.log
+run.log

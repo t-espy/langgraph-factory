@@ -4,6 +4,7 @@ import json
 import sys
 import threading
 import time
+from dataclasses import dataclass, field
 
 import requests
 from pydantic import SecretStr
@@ -13,6 +14,19 @@ from langgraph_factory.config import DMR_BASE_URL, DMR_API_KEY
 from langgraph_factory.utils import extract_json
 
 _print_lock = threading.Lock()
+
+
+@dataclass
+class LLMStats:
+    """Statistics from a single LLM call."""
+    model: str = ""
+    label: str = ""
+    elapsed_s: float = 0.0
+    tokens: int = 0
+    chars: int = 0
+    tok_s: float = 0.0
+    prompt_chars: int = 0
+    finish_reason: str = ""
 
 
 def get_langchain_llm(model: str, temperature: float = 0.2) -> ChatOpenAI:
@@ -56,8 +70,8 @@ def _dmr_stream(
     temperature: float,
     label: str,
     json_mode: bool,
-) -> str:
-    """Stream a chat completion from DMR and return the raw content string."""
+) -> tuple[str, LLMStats]:
+    """Stream a chat completion from DMR. Returns (content, stats)."""
     url = f"{DMR_BASE_URL}/chat/completions"
     headers = {
         "Content-Type": "application/json",
@@ -147,7 +161,17 @@ def _dmr_stream(
         )
         _print_progress(f"{tag} content tail: ...{content[-300:]}")
 
-    return content
+    stats = LLMStats(
+        model=model_short,
+        label=label,
+        elapsed_s=elapsed,
+        tokens=token_count,
+        chars=len(content),
+        tok_s=tok_s,
+        prompt_chars=prompt_chars,
+        finish_reason=finish_reason or "MISSING",
+    )
+    return content, stats
 
 
 def dmr_chat_json(
@@ -157,16 +181,16 @@ def dmr_chat_json(
     max_tokens: int = 4000,
     temperature: float = 0.2,
     label: str = "",
-) -> dict:
-    """Call Docker Model Runner with streaming, return parsed dict.
+) -> tuple[dict, LLMStats]:
+    """Call Docker Model Runner with streaming, return (parsed_dict, stats).
 
     Uses response_format=json_object. Suitable for structured outputs
     that don't contain complex nested strings (policy, manifest, etc.).
     """
-    content = _dmr_stream(
+    content, stats = _dmr_stream(
         model, system, user, max_tokens, temperature, label, json_mode=True,
     )
-    return extract_json(content)
+    return extract_json(content), stats
 
 
 def dmr_chat_raw(
@@ -176,12 +200,13 @@ def dmr_chat_raw(
     max_tokens: int = 4000,
     temperature: float = 0.2,
     label: str = "",
-) -> str:
-    """Call Docker Model Runner with streaming, return raw text.
+) -> tuple[str, LLMStats]:
+    """Call Docker Model Runner with streaming, return (raw_text, stats).
 
     No response_format constraint. Use this when the output contains
     code/file contents that would break JSON escaping.
     """
-    return _dmr_stream(
+    content, stats = _dmr_stream(
         model, system, user, max_tokens, temperature, label, json_mode=False,
     )
+    return content, stats

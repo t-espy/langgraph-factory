@@ -2,11 +2,11 @@
 
 Evolution of the MVP pipeline. Adds:
 - Architecture policy step (foreman produces a contract before generation)
-- Model warmup (avoid cold-start latency during generation)
 - Manifest step (plan file list with validation/retry before generating)
-- Build-fix loop (iterative patching from build errors)
+- Build-fix loop with mechanical error classification and LLM fallback
 - Package.json hash tracking (skip reinstall when deps unchanged)
 - Full regeneration fallback when fixes aren't enough
+- Per-step timing and end-of-run summary
 """
 
 import hashlib
@@ -27,7 +27,7 @@ from langgraph_factory.config import (
     MAX_GENERATE_ATTEMPTS,
     OUTPUT_DIR,
 )
-from langgraph_factory.llm import dmr_chat_json, dmr_chat_raw
+from langgraph_factory.llm import LLMStats, dmr_chat_json, dmr_chat_raw
 from langgraph_factory.utils import (
     extract_referenced_paths,
     log_detail,
@@ -52,6 +52,9 @@ class FactoryState(TypedDict, total=False):
     package_json_hash: str
     last_installed_package_json_hash: str
     last_patched_files: list[str]
+    fix_history: list[dict]
+    step_timings: list[dict]
+    pipeline_start: float
 
 
 def _require_spec(state: FactoryState) -> str:
@@ -79,6 +82,22 @@ def _run_cmd(cmd: list[str], cwd: str) -> subprocess.CompletedProcess:
     )
 
 
+def _record_step(state: FactoryState, node: str, elapsed_s: float,
+                  llm_stats: LLMStats | None = None, **extra) -> list[dict]:
+    """Append a step timing record and return the updated list."""
+    timings = list(state.get("step_timings", []))
+    entry: dict = {"node": node, "elapsed_s": round(elapsed_s, 1)}
+    if llm_stats:
+        entry["model"] = llm_stats.model
+        entry["tokens"] = llm_stats.tokens
+        entry["tok_s"] = round(llm_stats.tok_s, 1)
+        entry["prompt_chars"] = llm_stats.prompt_chars
+        entry["finish_reason"] = llm_stats.finish_reason
+    entry.update(extra)
+    timings.append(entry)
+    return timings
+
+
 def _log_build_failure(
     build_log: str, build_attempt: int, patched_files: list[str],
 ) -> None:
@@ -99,23 +118,11 @@ def _log_build_failure(
 # ---------------------------------------------------------------------------
 
 
-def warmup_node(state: FactoryState) -> dict:
-    """Warm the coder model to avoid cold-start latency during generation."""
-    log_step("Warmup model")
-    try:
-        dmr_chat_json(
-            model=CODER_MODEL, system="Return JSON only.",
-            user='{"ok":"warmup"}', max_tokens=32, temperature=0.0,
-            label="warmup",
-        )
-    except Exception:
-        pass  # warmup is opportunistic
-    return {}
-
-
 def policy_node(state: FactoryState) -> dict:
     """Generate an architecture contract from the app spec."""
     log_step("Generate architecture policy")
+    t0 = time.monotonic()
+
     system = (
         "You are a senior software architect. "
         "Return STRICT JSON only."
@@ -162,14 +169,19 @@ def policy_node(state: FactoryState) -> dict:
             },
         },
     })
-    out = dmr_chat_json(
+    out, stats = dmr_chat_json(
         model=FOREMAN_MODEL, system=system, user=user,
-        max_tokens=1200, temperature=0.4,
+        max_tokens=3000, temperature=0.4,
         label="policy",
     )
     contract = out.get("architecture_contract", {})
     acceptance = contract.get("acceptance", []) if isinstance(contract, dict) else []
-    return {"architecture_contract": contract, "acceptance": acceptance}
+    elapsed = time.monotonic() - t0
+    timings = _record_step(state, "policy", elapsed, stats)
+    return {
+        "architecture_contract": contract, "acceptance": acceptance,
+        "step_timings": timings, "pipeline_start": state.get("pipeline_start", t0),
+    }
 
 
 _REQUIRED_FILES = {"package.json", "tsconfig.json"}
@@ -216,10 +228,8 @@ def _build_manifest_prompt(state: FactoryState, issues: list[str] | None = None)
     )
     constraints = [
         "Include all config files: package.json, tsconfig.json, next.config.mjs.",
+        "Include a root layout file (e.g. src/app/layout.tsx or app/layout.tsx) — Next.js requires this.",
         "Include all source files: pages, lib, API routes, styles.",
-        "Use Tailwind CSS — do NOT plan separate UI primitive components (Button, Input, etc.).",
-        "Only plan a shared component file if it contains real logic reused across 3+ pages.",
-        "Keep the file count minimal. An experienced developer targets ~10-15 files for a CRUD app.",
         "imports_from should only reference paths within this project.",
         "Do NOT include file contents — only paths, descriptions, and metadata.",
     ]
@@ -238,15 +248,17 @@ def _build_manifest_prompt(state: FactoryState, issues: list[str] | None = None)
 def manifest_node(state: FactoryState) -> dict:
     """Generate and validate a file manifest. Retries once on validation failure."""
     log_step("Generate file manifest")
+    t0 = time.monotonic()
+    last_stats: LLMStats | None = None
 
     issues: list[str] = []
     for attempt in range(1, MAX_MANIFEST_ATTEMPTS + 1):
         system, user = _build_manifest_prompt(
             state, issues=issues if attempt > 1 else None,
         )
-        out = dmr_chat_json(
+        out, last_stats = dmr_chat_json(
             model=CODER_MODEL, system=system, user=user,
-            max_tokens=2000, temperature=0.3,
+            max_tokens=4000, temperature=0.3,
             label=f"manifest-{attempt}",
         )
         manifest = out.get("files", [])
@@ -262,18 +274,98 @@ def manifest_node(state: FactoryState) -> dict:
         issues = _validate_manifest(manifest)
         if not issues:
             log_detail("Manifest validation passed")
-            return {"manifest": manifest}
+            elapsed = time.monotonic() - t0
+            timings = _record_step(state, "manifest", elapsed, last_stats,
+                                   files_planned=len(manifest), attempts=attempt)
+            return {"manifest": manifest, "step_timings": timings}
 
         log_detail(f"Manifest validation failed: {'; '.join(issues)}")
         if attempt < MAX_MANIFEST_ATTEMPTS:
             log_detail("Retrying manifest generation...")
 
-    # Last attempt still had issues — proceed with warning, build-fix loop is the fallback
+    # Last attempt still had issues — proceed with warning
     log_detail(
         f"WARNING: manifest has unresolved issues after {MAX_MANIFEST_ATTEMPTS} attempts: "
         f"{'; '.join(issues)}. Proceeding anyway — build-fix loop will handle gaps."
     )
-    return {"manifest": manifest}
+    elapsed = time.monotonic() - t0
+    timings = _record_step(state, "manifest", elapsed, last_stats,
+                           files_planned=len(manifest), attempts=MAX_MANIFEST_ATTEMPTS,
+                           issues=issues)
+    return {"manifest": manifest, "step_timings": timings}
+
+
+# ---------------------------------------------------------------------------
+# Import reconciliation
+# ---------------------------------------------------------------------------
+
+# Packages that are built into Node.js or Next.js — never add to package.json
+_BUILTIN_MODULES = frozenset({
+    "react", "react-dom", "next", "fs", "path", "os", "url", "util",
+    "stream", "crypto", "http", "https", "events", "buffer", "querystring",
+    "child_process", "cluster", "dgram", "dns", "net", "readline", "tls",
+    "zlib", "assert", "constants", "module", "process", "timers", "tty",
+    "v8", "vm", "worker_threads", "perf_hooks",
+})
+
+# Import patterns for JS/TS
+_IMPORT_PATTERN = re.compile(
+    r"""(?:import\s+.*?\s+from\s+|import\s+|require\s*\(\s*)['"]([^'"]+)['"]""",
+)
+
+
+def _extract_npm_packages(files: dict[str, str]) -> set[str]:
+    """Scan source files for bare npm package imports (not relative or alias)."""
+    packages: set[str] = set()
+    for path, content in files.items():
+        if not path.endswith((".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")):
+            continue
+        for match in _IMPORT_PATTERN.finditer(content):
+            specifier = match.group(1)
+            # Skip relative imports and alias imports (@/ is project alias)
+            if specifier.startswith((".")) or specifier.startswith("@/"):
+                continue
+            # Extract package name: 'lodash/merge' -> 'lodash', '@radix-ui/react-slot' -> '@radix-ui/react-slot'
+            if specifier.startswith("@"):
+                parts = specifier.split("/")
+                pkg_name = "/".join(parts[:2]) if len(parts) >= 2 else specifier
+            else:
+                pkg_name = specifier.split("/")[0]
+            if pkg_name and pkg_name not in _BUILTIN_MODULES:
+                packages.add(pkg_name)
+    return packages
+
+
+def _reconcile_imports(files: dict[str, str]) -> dict[str, str]:
+    """Ensure every npm package imported in source files is in package.json."""
+    pkg_json_str = files.get("package.json")
+    if not pkg_json_str:
+        return files
+
+    try:
+        pkg = json.loads(pkg_json_str)
+    except json.JSONDecodeError:
+        return files
+
+    deps = pkg.get("dependencies", {})
+    dev_deps = pkg.get("devDependencies", {})
+    all_declared = set(deps) | set(dev_deps)
+
+    imported = _extract_npm_packages(files)
+    missing = imported - all_declared
+
+    if not missing:
+        return files
+
+    # Add missing packages to dependencies
+    for pkg_name in sorted(missing):
+        deps[pkg_name] = "latest"
+    pkg["dependencies"] = deps
+
+    log_detail(f"Import reconciliation: added missing packages to package.json: {', '.join(sorted(missing))}")
+    files = dict(files)
+    files["package.json"] = json.dumps(pkg, indent=2)
+    return files
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +377,7 @@ def generate_node(state: FactoryState) -> dict:
     """Generate the complete project in a single model call."""
     gen_attempt = state.get("generate_attempt", 0) + 1
     log_step(f"Generate project — monolithic (attempt {gen_attempt})")
+    t0 = time.monotonic()
 
     system = (
         "You are a meticulous senior engineer generating a complete runnable project.\n"
@@ -294,11 +387,9 @@ def generate_node(state: FactoryState) -> dict:
         "===END FILE===\n\n"
         "Do not omit required config files; ensure pnpm build will succeed.\n"
         "Obey the architecture_contract strictly.\n"
-        "If ui_strategy.mode is no_ui_imports, do NOT import @/components/ui/* "
-        "and use plain HTML + minimal CSS (or Tailwind only if included).\n"
-        "If ui_strategy.mode is local_primitives, create the required primitive "
-        "files and import them.\n"
-        "Do not depend on shadcn CLI."
+        "Every npm package you import MUST appear in package.json dependencies.\n"
+        "Every file you import from within the project MUST be included in your output.\n"
+        "If you create component files, they must export everything that other files import from them."
     )
 
     user = json.dumps({
@@ -322,23 +413,33 @@ def generate_node(state: FactoryState) -> dict:
         "attempt": gen_attempt,
     })
 
-    start = time.monotonic()
-    raw = dmr_chat_raw(
+    raw, stats = dmr_chat_raw(
         model=CODER_MODEL, system=system, user=user,
-        max_tokens=6000, temperature=0.2,
+        max_tokens=32000, temperature=0.2,
         label="generate-all",
     )
-    elapsed = time.monotonic() - start
+    elapsed = time.monotonic() - t0
     log_detail(f"Model response received in {elapsed:.1f}s")
 
     files = parse_fenced_files(raw)
     if not files:
-        # Dump first 500 chars for debugging
         log_detail(f"No fenced files found. Response start: {raw[:500]!r}")
         raise RuntimeError("Generate step returned no files in fence format")
 
     log_detail(f"Generated {len(files)} files")
-    return {"files": files, "generate_attempt": gen_attempt, "fix_attempt": 0}
+
+    # Reconcile imports: ensure every npm package used in source files
+    # is listed in package.json dependencies
+    files = _reconcile_imports(files)
+
+    total_chars = sum(len(c) for c in files.values())
+    timings = _record_step(state, "generate", elapsed, stats,
+                           files=len(files), total_chars=total_chars,
+                           attempt=gen_attempt)
+    return {
+        "files": files, "generate_attempt": gen_attempt, "fix_attempt": 0,
+        "step_timings": timings,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -387,6 +488,7 @@ def write_node(state: FactoryState) -> dict:
 def install_node(state: FactoryState) -> dict:
     """Install dependencies, skipping if package.json hasn't changed."""
     log_step("Install dependencies")
+    t0 = time.monotonic()
     project_dir = _require_project_dir(state)
     pkg_hash = state.get("package_json_hash")
     last_hash = state.get("last_installed_package_json_hash")
@@ -394,20 +496,34 @@ def install_node(state: FactoryState) -> dict:
     node_modules = os.path.join(project_dir, "node_modules")
     if os.path.isdir(node_modules) and pkg_hash and pkg_hash == last_hash:
         log_detail("deps already installed, skipping")
-        return {}
+        elapsed = time.monotonic() - t0
+        timings = _record_step(state, "install", elapsed, skipped=True)
+        return {"step_timings": timings}
 
     if shutil.which("pnpm") is None:
         raise RuntimeError("pnpm not found in PATH")
 
     p = _run_cmd(["pnpm", "install"], cwd=project_dir)
+    elapsed = time.monotonic() - t0
     if p.returncode != 0:
-        return {"last_build_ok": False, "last_build_log": f"pnpm install failed:\n{p.stdout}"}
-    return {"last_installed_package_json_hash": pkg_hash or last_hash}
+        timings = _record_step(state, "install", elapsed, ok=False)
+        return {
+            "last_build_ok": False,
+            "last_build_log": f"pnpm install failed:\n{p.stdout}",
+            "step_timings": timings,
+        }
+    log_detail(f"Install completed in {elapsed:.1f}s")
+    timings = _record_step(state, "install", elapsed, ok=True)
+    return {
+        "last_installed_package_json_hash": pkg_hash or last_hash,
+        "step_timings": timings,
+    }
 
 
 def build_node(state: FactoryState) -> dict:
     """Run pnpm build."""
     log_step("Run pnpm build")
+    t0 = time.monotonic()
     project_dir = _require_project_dir(state)
     build_attempt = state.get("build_attempt", 0) + 1
 
@@ -415,17 +531,108 @@ def build_node(state: FactoryState) -> dict:
         raise RuntimeError("pnpm not found in PATH")
 
     p = _run_cmd(["pnpm", "build"], cwd=project_dir)
+    elapsed = time.monotonic() - t0
     ok = p.returncode == 0
-    if not ok:
+    if ok:
+        log_detail(f"Build succeeded in {elapsed:.1f}s")
+    else:
         _log_build_failure(p.stdout or "", build_attempt, state.get("last_patched_files", []))
-    return {"last_build_ok": ok, "last_build_log": p.stdout, "build_attempt": build_attempt}
+        log_detail(f"Build failed in {elapsed:.1f}s")
+    timings = _record_step(state, "build", elapsed, ok=ok, attempt=build_attempt)
+    return {
+        "last_build_ok": ok, "last_build_log": p.stdout,
+        "build_attempt": build_attempt, "step_timings": timings,
+    }
+
+
+def _try_mechanical_fix(build_log: str, files: dict[str, str]) -> dict[str, str] | None:
+    """Try to fix build errors mechanically without calling the LLM.
+
+    Returns a dict of {path: new_content} for patched files, or None if
+    no mechanical fix applies.
+    """
+    # Pattern: missing npm package (bare module, not relative or alias imports)
+    missing_modules = re.findall(
+        r"Module not found: Can't resolve '([^./][^']*)'", build_log,
+    )
+    if not missing_modules:
+        return None
+
+    pkg_json_str = files.get("package.json")
+    if not pkg_json_str:
+        return None
+
+    try:
+        pkg = json.loads(pkg_json_str)
+    except json.JSONDecodeError:
+        return None
+
+    deps = pkg.get("dependencies", {})
+    added = []
+    for mod in missing_modules:
+        # Extract the package name (handle scoped packages)
+        pkg_name = mod if mod.startswith("@") else mod.split("/")[0]
+        if pkg_name not in deps:
+            deps[pkg_name] = "latest"
+            added.append(pkg_name)
+
+    if not added:
+        return None
+
+    pkg["dependencies"] = deps
+    log_detail(f"Mechanical fix: adding missing packages to package.json: {', '.join(added)}")
+    return {"package.json": json.dumps(pkg, indent=2)}
+
+
+def _build_fix_history_text(fix_history: list[dict]) -> str:
+    """Format prior fix attempts for inclusion in the LLM prompt."""
+    if not fix_history:
+        return ""
+    parts = []
+    for entry in fix_history:
+        kind = "mechanical" if entry.get("mechanical") else "LLM"
+        parts.append(
+            f"- Attempt {entry['attempt']} ({kind}): "
+            f"patched {', '.join(entry['patches'])}. "
+            f"Error: {entry['error_summary']}"
+        )
+    return "Prior fix attempts (DO NOT repeat these):\n" + "\n".join(parts) + "\n\n"
 
 
 def fix_node(state: FactoryState) -> dict:
-    """Ask the coder model to fix build errors with minimal patches."""
+    """Fix build errors: try mechanical fixes first, fall back to LLM."""
     fix_attempt = state.get("fix_attempt", 0) + 1
     log_step(f"Apply fix (attempt {fix_attempt})")
+    t0 = time.monotonic()
 
+    files = state.get("files", {})
+    project_dir = state.get("project_dir")
+    build_log = state.get("last_build_log", "")
+    fix_history = list(state.get("fix_history", []))
+
+    # --- Try mechanical fix first ---
+    mechanical_patches = _try_mechanical_fix(build_log, files)
+    if mechanical_patches:
+        patched_files = sorted(mechanical_patches.keys())
+        log_detail(f"Mechanical fix patched: {', '.join(patched_files)}")
+        merged = dict(files)
+        merged.update(mechanical_patches)
+        fix_history.append({
+            "attempt": fix_attempt,
+            "error_summary": build_log.strip().splitlines()[-1][:200] if build_log.strip() else "",
+            "patches": patched_files,
+            "mechanical": True,
+        })
+        elapsed = time.monotonic() - t0
+        timings = _record_step(state, "fix", elapsed, mechanical=True,
+                               patches=patched_files)
+        return {
+            "files": merged, "fix_attempt": fix_attempt,
+            "last_patched_files": patched_files, "fix_history": fix_history,
+            "step_timings": timings,
+        }
+
+    # --- LLM fix ---
     system = (
         "You are a senior engineer fixing a broken Next.js project.\n"
         "Do NOT refactor the project structure.\n"
@@ -443,37 +650,18 @@ def fix_node(state: FactoryState) -> dict:
         "IMPORTANT: Use next.config.mjs (NOT next.config.ts) — Next.js 14 does not support TypeScript config files."
     )
 
-    files = state.get("files", {})
-    project_dir = state.get("project_dir")
-    build_log = state.get("last_build_log", "")
-
-    # Include relevant file snapshots for context
-    snapshots: dict[str, str] = {}
-    for key in ("package.json", "tsconfig.json"):
-        if key in files:
-            snapshots[key] = files[key]
-    for path in files:
-        if path.startswith("next.config."):
-            snapshots[path] = files[path]
-
-    referenced = extract_referenced_paths(build_log, project_dir)
-    added = 0
-    for path in referenced:
-        if path in files and path not in snapshots:
-            snapshots[path] = files[path]
-            added += 1
-            if added >= 5:
-                break
-
-    # Format snapshots as fenced content for the model
+    # Send all project files as context — the model has 128k context, use it
     snapshot_text = ""
-    for path, content in snapshots.items():
-        snapshot_text += f"===CURRENT FILE: {path}===\n{content}\n===END CURRENT FILE===\n\n"
+    for path in sorted(files.keys()):
+        snapshot_text += f"===CURRENT FILE: {path}===\n{files[path]}\n===END CURRENT FILE===\n\n"
+
+    history_text = _build_fix_history_text(fix_history)
 
     user = (
         f"Build log (last 12000 chars):\n{build_log[-12000:]}\n\n"
         f"Architecture contract:\n{json.dumps(state.get('architecture_contract', {}))}\n\n"
         f"All project files: {', '.join(sorted(files.keys()))}\n\n"
+        f"{history_text}"
         f"Current file contents:\n{snapshot_text}\n"
         f"Fix attempt: {fix_attempt}\n\n"
         "Instructions:\n"
@@ -485,9 +673,9 @@ def fix_node(state: FactoryState) -> dict:
         "- To delete a file, use ===DELETE: path===\n"
     )
 
-    raw = dmr_chat_raw(
+    raw, stats = dmr_chat_raw(
         model=CODER_MODEL, system=system, user=user,
-        max_tokens=8000, temperature=0.2,
+        max_tokens=16000, temperature=0.2,
         label="fix",
     )
 
@@ -510,14 +698,107 @@ def fix_node(state: FactoryState) -> dict:
     for path in deletions:
         merged.pop(path, None)
     merged.update(patches)
-    return {"files": merged, "fix_attempt": fix_attempt, "last_patched_files": patched_files}
+
+    # Build a concise error summary from the build log
+    error_lines = [l for l in build_log.splitlines() if "error" in l.lower() or "Error" in l]
+    error_summary = "; ".join(error_lines[:3])[:300] if error_lines else build_log.strip().splitlines()[-1][:200]
+
+    fix_history.append({
+        "attempt": fix_attempt,
+        "error_summary": error_summary,
+        "patches": patched_files + [f"DELETE:{d}" for d in deletions],
+        "mechanical": False,
+    })
+    elapsed = time.monotonic() - t0
+    timings = _record_step(state, "fix", elapsed, stats, mechanical=False,
+                           patches=patched_files)
+    return {
+        "files": merged, "fix_attempt": fix_attempt,
+        "last_patched_files": patched_files, "fix_history": fix_history,
+        "step_timings": timings,
+    }
+
+
+def _print_summary(state: FactoryState) -> None:
+    """Print a run summary with per-step timings and model stats."""
+    timings = state.get("step_timings", [])
+    pipeline_start = state.get("pipeline_start", 0)
+    total_elapsed = time.monotonic() - pipeline_start if pipeline_start else 0
+
+    print("\n" + "=" * 70)
+    print("RUN SUMMARY")
+    print("=" * 70)
+
+    # Per-step table
+    print(f"\n{'Step':<20} {'Time':>8} {'Tokens':>8} {'tok/s':>8} {'Model':<25} {'Notes'}")
+    print("-" * 90)
+    for t in timings:
+        node = t["node"]
+        elapsed = f"{t['elapsed_s']:.1f}s"
+        tokens = str(t.get("tokens", "")) if t.get("tokens") else ""
+        tok_s = f"{t['tok_s']:.1f}" if t.get("tok_s") else ""
+        model = t.get("model", "")
+        notes_parts = []
+        if t.get("files"):
+            notes_parts.append(f"{t['files']} files")
+        if t.get("total_chars"):
+            notes_parts.append(f"{t['total_chars']:,} chars")
+        if t.get("attempt") and t["attempt"] > 1:
+            notes_parts.append(f"attempt {t['attempt']}")
+        if t.get("attempts") and t["attempts"] > 1:
+            notes_parts.append(f"{t['attempts']} attempts")
+        if t.get("files_planned"):
+            notes_parts.append(f"{t['files_planned']} planned")
+        if t.get("mechanical"):
+            notes_parts.append("mechanical")
+        if t.get("patches"):
+            notes_parts.append(f"patched: {', '.join(t['patches'])}")
+        if t.get("skipped"):
+            notes_parts.append("skipped")
+        if "ok" in t:
+            notes_parts.append("OK" if t["ok"] else "FAILED")
+        if t.get("finish_reason") and t["finish_reason"] != "stop":
+            notes_parts.append(f"finish={t['finish_reason']}")
+        notes = ", ".join(notes_parts)
+        print(f"{node:<20} {elapsed:>8} {tokens:>8} {tok_s:>8} {model:<25} {notes}")
+
+    # Aggregate model stats
+    model_stats: dict[str, dict] = {}
+    for t in timings:
+        model = t.get("model", "")
+        if not model or not t.get("tokens"):
+            continue
+        if model not in model_stats:
+            model_stats[model] = {"total_tokens": 0, "total_time": 0.0, "calls": 0}
+        model_stats[model]["total_tokens"] += t["tokens"]
+        model_stats[model]["total_time"] += t["elapsed_s"]
+        model_stats[model]["calls"] += 1
+
+    if model_stats:
+        print(f"\n{'Model':<30} {'Calls':>6} {'Tokens':>10} {'Total Time':>12} {'Avg tok/s':>10}")
+        print("-" * 70)
+        for model, ms in model_stats.items():
+            avg_tok_s = ms["total_tokens"] / ms["total_time"] if ms["total_time"] > 0 else 0
+            print(f"{model:<30} {ms['calls']:>6} {ms['total_tokens']:>10,} {ms['total_time']:>11.1f}s {avg_tok_s:>9.1f}")
+
+    # Overall
+    build_attempts = sum(1 for t in timings if t["node"] == "build")
+    fix_attempts = sum(1 for t in timings if t["node"] == "fix")
+    gen_attempts = sum(1 for t in timings if t["node"] == "generate")
+    print(f"\nTotal pipeline time: {total_elapsed:.1f}s")
+    print(f"Generate attempts: {gen_attempts}  |  Fix attempts: {fix_attempts}  |  Build attempts: {build_attempts}")
+    print(f"Result: {'BUILD OK' if state.get('last_build_ok') else 'FAILED'}")
+    print(f"Project: {state.get('project_dir', 'N/A')}")
+    print("=" * 70)
 
 
 def done_node(state: FactoryState) -> dict:
+    _print_summary(state)
     return {}
 
 
 def fail_node(state: FactoryState) -> dict:
+    _print_summary(state)
     raise RuntimeError(
         "Failed to reach a successful pnpm build within retry limits.\n\n"
         f"Project dir: {state.get('project_dir')}\n\n"
@@ -557,13 +838,13 @@ def decide_next(state: FactoryState) -> str:
 def build_factory_graph():
     """Build the full factory pipeline graph.
 
-    Pipeline: warmup → policy → generate → write → install → build
-    with fix loop and regeneration fallback on build failure.
+    Pipeline: policy -> manifest -> generate -> write -> install -> build
+    with fix loop (mechanical + LLM) and regeneration fallback.
     """
     g = StateGraph(FactoryState)
 
-    g.add_node("warmup", warmup_node)
     g.add_node("policy", policy_node)
+    g.add_node("manifest", manifest_node)
     g.add_node("generate", generate_node)
     g.add_node("write", write_node)
     g.add_node("install", install_node)
@@ -572,9 +853,9 @@ def build_factory_graph():
     g.add_node("done", done_node)
     g.add_node("fail", fail_node)
 
-    g.add_edge(START, "warmup")
-    g.add_edge("warmup", "policy")
-    g.add_edge("policy", "generate")
+    g.add_edge(START, "policy")
+    g.add_edge("policy", "manifest")
+    g.add_edge("manifest", "generate")
 
     g.add_edge("generate", "write")
     g.add_edge("write", "install")

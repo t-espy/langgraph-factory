@@ -8,12 +8,13 @@ DMR_API_KEY = os.environ.get("DMR_API_KEY", "local-dummy")
 
 # Models
 FOREMAN_MODEL = os.environ.get(
-    "FOREMAN_MODEL", "docker.io/ai/deepseek-r1-distill-llama:70B-Q4_K_M"
+    "FOREMAN_MODEL", "docker.io/ai/gpt-oss:20B"
 )
 CODER_MODEL = os.environ.get("CODER_MODEL", "docker.io/ai/qwen3-coder-next:latest")
 
-# Output
-OUTPUT_DIR = os.environ.get("FACTORY_OUTPUT_DIR", os.path.join(os.getcwd(), "factory_out"))
+# Output — runs go under a single parent directory
+RUNS_DIR = os.environ.get("FACTORY_RUNS_DIR", os.path.join(os.getcwd(), "runs"))
+OUTPUT_DIR = RUNS_DIR  # default; examples override with timestamped subdirs
 
 # Retry limits
 MAX_GENERATE_ATTEMPTS = int(os.environ.get("MAX_GENERATE_ATTEMPTS", "2"))

@@ -164,6 +164,8 @@ def parse_fenced_files(text: str) -> dict[str, str]:
         # Remove trailing newline added before ===END FILE===
         if content.endswith("\n"):
             content = content[:-1]
+        # Strip any leaked delimiters from content (model sometimes nests them)
+        content = re.sub(r"^===(?:FILE|DELETE|END FILE|CURRENT FILE|END CURRENT FILE):?.*===\n?", "", content, flags=re.MULTILINE)
         files[path] = content
 
     return files

@@ -1,6 +1,10 @@
 """Example: generate a CRUD products app using the factory pipeline."""
 
+import os
+from datetime import datetime
+
 from langgraph_factory import build_factory_graph
+from langgraph_factory.config import RUNS_DIR
 
 SPEC = """\
 A Next.js App Router CRUD app for managing products.
@@ -25,7 +29,10 @@ Use in-memory storage. No database required.
 """
 
 if __name__ == "__main__":
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = os.path.join(RUNS_DIR, f"run_{ts}")
+    os.makedirs(output_dir, exist_ok=True)
     graph = build_factory_graph()
-    result = graph.invoke({"spec": SPEC})
+    result = graph.invoke({"spec": SPEC, "project_dir": output_dir})
     print(f"\nProject written to: {result.get('project_dir')}")
     print(f"Build OK: {result.get('last_build_ok')}")
