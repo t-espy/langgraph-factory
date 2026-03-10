@@ -116,9 +116,12 @@ def warmup_node(state: FactoryState) -> dict:
 def policy_node(state: FactoryState) -> dict:
     """Generate an architecture contract from the app spec."""
     log_step("Generate architecture policy")
-    system = "You are a senior software architect. Return STRICT JSON only."
+    system = (
+        "You are a senior software architect. "
+        "Return STRICT JSON only."
+    )
     user = json.dumps({
-        "task": "Produce an architecture_contract for a Next.js App Router CRUD app.",
+        "task": "Produce an architecture_contract for a Next.js App Router CRUD app generator.",
         "app_spec": _require_spec(state),
         "requirements": [
             "Do NOT output a file list. Output only the architecture contract.",
@@ -126,23 +129,42 @@ def policy_node(state: FactoryState) -> dict:
             "Package manager must be pnpm.",
             "In-memory storage acceptable for MVP.",
             "Goal: pnpm build must pass.",
-            "Use Tailwind CSS for styling — apply classes directly to elements.",
-            "Only extract shared components when genuinely reused with real logic.",
-            "Keep the file count minimal. Every file is a maintenance cost.",
         ],
         "output_schema": {
             "architecture_contract": {
-                "project_layout": "app_router",
-                "typescript": True,
+                "project_layout": "src_app_router | app_router",
+                "typescript": "boolean",
                 "package_manager": "pnpm",
-                "styling": "tailwind",
+                "import_aliases": {"@/*": "./src/*"},
+                "ui_strategy": {
+                    "mode": "no_ui_imports | local_primitives",
+                    "allowed_import_prefixes": ["@/components/ui/"],
+                    "primitives": [
+                        "button", "input", "label", "card",
+                        "table", "textarea", "select",
+                    ],
+                },
+                "entity": {
+                    "name": "Product",
+                    "fields": [
+                        {"name": "id", "type": "string"},
+                        {"name": "name", "type": "string"},
+                        {"name": "price", "type": "number"},
+                        {"name": "createdAt", "type": "string"},
+                    ],
+                },
+                "routes": ["/products", "/products/new", "/products/[id]"],
+                "server_client_rules": {
+                    "prefer_server_components": "boolean",
+                    "use_client_only_for_forms": "boolean",
+                },
                 "acceptance": ["pnpm build"],
             },
         },
     })
     out = dmr_chat_json(
         model=FOREMAN_MODEL, system=system, user=user,
-        max_tokens=2000, temperature=0.4,
+        max_tokens=1200, temperature=0.4,
         label="policy",
     )
     contract = out.get("architecture_contract", {})
@@ -270,51 +292,40 @@ def generate_node(state: FactoryState) -> dict:
         "===FILE: relative/path.ext===\n"
         "file contents here\n"
         "===END FILE===\n\n"
-        "Write every file needed for pnpm install and pnpm build to succeed.\n"
+        "Do not omit required config files; ensure pnpm build will succeed.\n"
         "Obey the architecture_contract strictly.\n"
-        "Use Tailwind CSS classes directly on elements. Only extract a shared component when it is reused 3+ times with real logic.\n"
-        "Keep the file count minimal — an experienced developer would not create wrapper components for basic HTML elements.\n"
-        "IMPORTANT: Use next.config.mjs (NOT next.config.ts) — Next.js 14 does not support TypeScript config files."
+        "If ui_strategy.mode is no_ui_imports, do NOT import @/components/ui/* "
+        "and use plain HTML + minimal CSS (or Tailwind only if included).\n"
+        "If ui_strategy.mode is local_primitives, create the required primitive "
+        "files and import them.\n"
+        "Do not depend on shadcn CLI."
     )
 
-    # Include manifest if available — gives the model a structured file plan
-    manifest = state.get("manifest", [])
-    file_plan = [
-        {"path": m.get("path", ""), "description": m.get("description", ""),
-         "imports_from": m.get("imports_from", []), "category": m.get("category", "")}
-        for m in manifest
-    ] if manifest else None
-
-    user_payload = {
+    user = json.dumps({
         "app_spec": _require_spec(state),
         "architecture_contract": state.get("architecture_contract", {}),
         "constraints": [
             "Project must be Next.js App Router + TypeScript.",
             "Provide all files required for pnpm install and pnpm build.",
             "Keep it minimal but complete.",
-            "In-memory store is fine; prefer server components + route handlers.",
+            "CRUD entity: Products (id, name, price, createdAt).",
+            "Pages: /products (list), /products/new (create), /products/[id] (detail).",
+            "In-memory store is fine; prefer server components + route handlers or server actions.",
             "Avoid external DB for MVP.",
-            "Use next.config.mjs (NOT next.config.ts) — Next.js 14 does not support .ts config.",
         ],
         "output_requirements": [
             "Output ONLY ===FILE: path=== ... ===END FILE=== blocks.",
             "Every file must contain full, complete code (no placeholders).",
             "Do not reference files that you did not include.",
+            "Honor ui_strategy mode in architecture_contract.",
         ],
         "attempt": gen_attempt,
-    }
-    if file_plan:
-        user_payload["file_plan"] = file_plan
-        user_payload["output_requirements"].append(
-            "Generate exactly the files listed in file_plan. "
-            "Respect the imports_from dependencies between files."
-        )
-    user = json.dumps(user_payload)
+    })
 
     start = time.monotonic()
     raw = dmr_chat_raw(
         model=CODER_MODEL, system=system, user=user,
-        max_tokens=16000, temperature=0.2,
+        max_tokens=6000, temperature=0.2,
         label="generate-all",
     )
     elapsed = time.monotonic() - start
@@ -546,14 +557,13 @@ def decide_next(state: FactoryState) -> str:
 def build_factory_graph():
     """Build the full factory pipeline graph.
 
-    Pipeline: warmup → policy → manifest → generate → write → install → build
+    Pipeline: warmup → policy → generate → write → install → build
     with fix loop and regeneration fallback on build failure.
     """
     g = StateGraph(FactoryState)
 
     g.add_node("warmup", warmup_node)
     g.add_node("policy", policy_node)
-    g.add_node("manifest", manifest_node)
     g.add_node("generate", generate_node)
     g.add_node("write", write_node)
     g.add_node("install", install_node)
@@ -564,8 +574,7 @@ def build_factory_graph():
 
     g.add_edge(START, "warmup")
     g.add_edge("warmup", "policy")
-    g.add_edge("policy", "manifest")
-    g.add_edge("manifest", "generate")
+    g.add_edge("policy", "generate")
 
     g.add_edge("generate", "write")
     g.add_edge("write", "install")
