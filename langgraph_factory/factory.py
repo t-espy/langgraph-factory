@@ -53,6 +53,7 @@ class FactoryState(TypedDict, total=False):
     last_installed_package_json_hash: str
     last_patched_files: list[str]
     fix_history: list[dict]
+    review_verdict: dict  # from gpt-oss reviewer: {action, guidance, reasoning}
     step_timings: list[dict]
     pipeline_start: float
 
@@ -662,39 +663,42 @@ def _build_fix_history_text(fix_history: list[dict]) -> str:
 
 
 def fix_node(state: FactoryState) -> dict:
-    """Fix build errors: try mechanical fixes first, fall back to LLM."""
+    """Fix build errors: apply mechanical or LLM fixes based on reviewer verdict."""
     fix_attempt = state.get("fix_attempt", 0) + 1
     log_step(f"Apply fix (attempt {fix_attempt})")
     t0 = time.monotonic()
 
     files = state.get("files", {})
-    project_dir = state.get("project_dir")
     build_log = state.get("last_build_log", "")
     fix_history = list(state.get("fix_history", []))
+    verdict = state.get("review_verdict", {})
 
-    # --- Try mechanical fix first ---
-    mechanical_patches = _try_mechanical_fix(build_log, files)
-    if mechanical_patches:
-        patched_files = sorted(mechanical_patches.keys())
-        log_detail(f"Mechanical fix patched: {', '.join(patched_files)}")
-        merged = dict(files)
-        merged.update(mechanical_patches)
-        fix_history.append({
-            "attempt": fix_attempt,
-            "error_summary": build_log.strip().splitlines()[-1][:200] if build_log.strip() else "",
-            "patches": patched_files,
-            "mechanical": True,
-        })
-        elapsed = time.monotonic() - t0
-        timings = _record_step(state, "fix", elapsed, mechanical=True,
-                               patches=patched_files)
-        return {
-            "files": merged, "fix_attempt": fix_attempt,
-            "last_patched_files": patched_files, "fix_history": fix_history,
-            "step_timings": timings,
-        }
+    # --- Mechanical fix (reviewer already detected it) ---
+    if verdict.get("mechanical"):
+        mechanical_patches = _try_mechanical_fix(build_log, files)
+        if mechanical_patches:
+            patched_files = sorted(mechanical_patches.keys())
+            log_detail(f"Mechanical fix patched: {', '.join(patched_files)}")
+            merged = dict(files)
+            merged.update(mechanical_patches)
+            fix_history.append({
+                "attempt": fix_attempt,
+                "error_summary": build_log.strip().splitlines()[-1][:200] if build_log.strip() else "",
+                "patches": patched_files,
+                "mechanical": True,
+            })
+            elapsed = time.monotonic() - t0
+            timings = _record_step(state, "fix", elapsed, mechanical=True,
+                                   patches=patched_files)
+            return {
+                "files": merged, "fix_attempt": fix_attempt,
+                "last_patched_files": patched_files, "fix_history": fix_history,
+                "step_timings": timings,
+            }
 
     # --- LLM fix ---
+    reviewer_guidance = verdict.get("guidance", "")
+
     system = (
         "You are a senior engineer fixing a broken Next.js project.\n"
         "Do NOT refactor the project structure.\n"
@@ -719,8 +723,17 @@ def fix_node(state: FactoryState) -> dict:
 
     history_text = _build_fix_history_text(fix_history)
 
+    # Include reviewer guidance when available
+    guidance_text = ""
+    if reviewer_guidance:
+        guidance_text = (
+            f"REVIEWER GUIDANCE (from senior engineering lead):\n"
+            f"{reviewer_guidance}\n\n"
+        )
+
     user = (
         f"Build log (last 12000 chars):\n{build_log[-12000:]}\n\n"
+        f"{guidance_text}"
         f"Architecture contract:\n{json.dumps(state.get('architecture_contract', {}))}\n\n"
         f"All project files: {', '.join(sorted(files.keys()))}\n\n"
         f"{history_text}"
@@ -885,27 +898,128 @@ def fail_node(state: FactoryState) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Review (gpt-oss as build-failure reviewer)
+# ---------------------------------------------------------------------------
+
+
+def review_node(state: FactoryState) -> dict:
+    """Have the foreman model review build failures and decide the strategy.
+
+    Returns a verdict: fix (with guidance), regenerate, or fail.
+    Mechanical fixes bypass the reviewer — they go straight to fix_node.
+    """
+    build_log = state.get("last_build_log", "")
+    fix_attempt = state.get("fix_attempt", 0)
+    gen_attempt = state.get("generate_attempt", 0)
+    fix_history = state.get("fix_history", [])
+
+    log_step(f"Review build failure (fix={fix_attempt}, gen={gen_attempt})")
+    t0 = time.monotonic()
+
+    # Check for mechanical fix first — skip the LLM reviewer entirely
+    files = state.get("files", {})
+    mechanical_patches = _try_mechanical_fix(build_log, files)
+    if mechanical_patches:
+        log_detail("Reviewer skipped — mechanical fix available")
+        elapsed = time.monotonic() - t0
+        timings = _record_step(state, "review", elapsed, skipped="mechanical")
+        return {
+            "review_verdict": {
+                "action": "fix",
+                "guidance": "Mechanical fix available — apply automatically.",
+                "reasoning": "Deterministic pattern match.",
+                "mechanical": True,
+            },
+            "step_timings": timings,
+        }
+
+    history_text = _build_fix_history_text(fix_history)
+
+    system = (
+        "You are a senior engineering lead reviewing a build failure.\n"
+        "Your job is to decide the best recovery strategy — NOT to write code.\n\n"
+        "Return STRICT JSON with these fields:\n"
+        '  "action": one of "fix", "regenerate", or "fail"\n'
+        '  "reasoning": 1-2 sentences on why you chose this action\n'
+        '  "guidance": if action is "fix", specific guidance for the engineer '
+        "on what to change and in which files (2-4 sentences max)\n\n"
+        "Decision criteria:\n"
+        '- "fix": the errors are localized (type mismatches, missing imports, '
+        "small logic errors in 1-3 files). Most build failures should be fixable.\n"
+        '- "regenerate": the errors are systemic (wrong project structure, '
+        "fundamentally broken architecture, many files affected, or prior fix "
+        "attempts have failed to make progress).\n"
+        '- "fail": you believe the spec or architecture contract is contradictory '
+        "or impossible to satisfy, or all retry budgets are exhausted.\n"
+    )
+
+    user = json.dumps({
+        "build_log_tail": build_log[-6000:],
+        "fix_attempt": fix_attempt,
+        "max_fix_attempts": MAX_FIX_ATTEMPTS,
+        "generate_attempt": gen_attempt,
+        "max_generate_attempts": MAX_GENERATE_ATTEMPTS,
+        "fix_history": fix_history[-5:],  # last 5 attempts
+        "architecture_contract": state.get("architecture_contract", {}),
+        "file_list": sorted(files.keys()),
+    })
+
+    verdict, stats = dmr_chat_json(
+        model=FOREMAN_MODEL, system=system, user=user,
+        max_tokens=2000, temperature=0.3,
+        label="review",
+    )
+
+    action = verdict.get("action", "fix")
+    # Enforce retry budget limits regardless of what the model says
+    if action == "fix" and fix_attempt >= MAX_FIX_ATTEMPTS:
+        if gen_attempt < MAX_GENERATE_ATTEMPTS:
+            action = "regenerate"
+            verdict["reasoning"] = (verdict.get("reasoning", "") +
+                                    " (overridden: fix budget exhausted)")
+        else:
+            action = "fail"
+            verdict["reasoning"] = (verdict.get("reasoning", "") +
+                                    " (overridden: all budgets exhausted)")
+    elif action == "regenerate" and gen_attempt >= MAX_GENERATE_ATTEMPTS:
+        action = "fail"
+        verdict["reasoning"] = (verdict.get("reasoning", "") +
+                                " (overridden: regenerate budget exhausted)")
+
+    verdict["action"] = action
+    log_detail(f"Reviewer verdict: {action} — {verdict.get('reasoning', '')}")
+    if action == "fix" and verdict.get("guidance"):
+        log_detail(f"Reviewer guidance: {verdict['guidance']}")
+
+    elapsed = time.monotonic() - t0
+    timings = _record_step(state, "review", elapsed, stats)
+    return {
+        "review_verdict": verdict,
+        "step_timings": timings,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Routing
 # ---------------------------------------------------------------------------
 
 
-def decide_next(state: FactoryState) -> str:
+def decide_after_build(state: FactoryState) -> str:
+    """Route after build: success → done, failure → review."""
     if state.get("last_build_ok"):
         return "done"
+    return "review"
 
-    log = state.get("last_build_log", "")
-    if "pnpm install failed" in log:
-        if state.get("generate_attempt", 0) < MAX_GENERATE_ATTEMPTS:
-            return "regenerate"
-        return "fail"
 
-    if state.get("fix_attempt", 0) < MAX_FIX_ATTEMPTS:
-        return "fix"
-
-    if state.get("generate_attempt", 0) < MAX_GENERATE_ATTEMPTS:
+def decide_after_review(state: FactoryState) -> str:
+    """Route based on the reviewer's verdict."""
+    verdict = state.get("review_verdict", {})
+    action = verdict.get("action", "fix")
+    if action == "regenerate":
         return "regenerate"
-
-    return "fail"
+    if action == "fail":
+        return "fail"
+    return "fix"
 
 
 # ---------------------------------------------------------------------------
@@ -927,6 +1041,7 @@ def build_factory_graph():
     g.add_node("write", write_node)
     g.add_node("install", install_node)
     g.add_node("build", build_node)
+    g.add_node("review", review_node)
     g.add_node("fix", fix_node)
     g.add_node("done", done_node)
     g.add_node("fail", fail_node)
@@ -939,13 +1054,23 @@ def build_factory_graph():
     g.add_edge("write", "install")
     g.add_edge("install", "build")
 
+    # Build outcome: success → done, failure → review
     g.add_conditional_edges(
         "build",
-        decide_next,
+        decide_after_build,
+        {
+            "done": "done",
+            "review": "review",
+        },
+    )
+
+    # Review outcome: fix, regenerate, or fail
+    g.add_conditional_edges(
+        "review",
+        decide_after_review,
         {
             "fix": "fix",
             "regenerate": "generate",
-            "done": "done",
             "fail": "fail",
         },
     )
