@@ -389,7 +389,9 @@ def generate_node(state: FactoryState) -> dict:
         "Obey the architecture_contract strictly.\n"
         "Every npm package you import MUST appear in package.json dependencies.\n"
         "Every file you import from within the project MUST be included in your output.\n"
-        "If you create component files, they must export everything that other files import from them."
+        "If you create component files, they must export everything that other files import from them.\n"
+        "Put shared TypeScript types and in-memory stores in a dedicated file (e.g. lib/types.ts, lib/store.ts) "
+        "and import from there — NEVER duplicate type definitions or stores across files."
     )
 
     user = json.dumps({
@@ -399,8 +401,8 @@ def generate_node(state: FactoryState) -> dict:
             "Project must be Next.js App Router + TypeScript.",
             "Provide all files required for pnpm install and pnpm build.",
             "Keep it minimal but complete.",
-            "CRUD entity: Products (id, name, price, createdAt).",
-            "Pages: /products (list), /products/new (create), /products/[id] (detail).",
+            "Derive ALL entity fields, pages, and routes from the app_spec and architecture_contract — do not hardcode or omit fields.",
+            "Sample/seed data must include every field defined in the entity type.",
             "In-memory store is fine; prefer server components + route handlers or server actions.",
             "Avoid external DB for MVP.",
         ],
@@ -551,37 +553,97 @@ def _try_mechanical_fix(build_log: str, files: dict[str, str]) -> dict[str, str]
     Returns a dict of {path: new_content} for patched files, or None if
     no mechanical fix applies.
     """
-    # Pattern: missing npm package (bare module, not relative or alias imports)
+    patches: dict[str, str] = {}
+
+    # --- Fix 1: missing npm packages ---
     missing_modules = re.findall(
         r"Module not found: Can't resolve '([^./][^']*)'", build_log,
     )
-    if not missing_modules:
-        return None
+    if missing_modules:
+        pkg_json_str = files.get("package.json")
+        if pkg_json_str:
+            try:
+                pkg = json.loads(pkg_json_str)
+                deps = pkg.get("dependencies", {})
+                added = []
+                for mod in missing_modules:
+                    pkg_name = mod if mod.startswith("@") else mod.split("/")[0]
+                    if pkg_name not in deps:
+                        deps[pkg_name] = "latest"
+                        added.append(pkg_name)
+                if added:
+                    pkg["dependencies"] = deps
+                    log_detail(f"Mechanical fix: adding missing packages: {', '.join(added)}")
+                    patches["package.json"] = json.dumps(pkg, indent=2)
+            except json.JSONDecodeError:
+                pass
 
-    pkg_json_str = files.get("package.json")
-    if not pkg_json_str:
-        return None
+    # --- Fix 2: "Cannot find name 'X'" — find the type/interface in another
+    #     file and add an import statement to the broken file ---
+    missing_names = re.findall(
+        r"^(\./[^:]+):.*Cannot find name '(\w+)'", build_log, re.MULTILINE,
+    )
+    if missing_names:
+        # Build index: which files export/define which names
+        _TYPE_DEF_RE = re.compile(
+            r"(?:export\s+)?(?:type|interface|enum|class)\s+(\w+)"
+        )
+        name_to_file: dict[str, str] = {}
+        for fpath, content in files.items():
+            if not fpath.endswith((".ts", ".tsx")):
+                continue
+            for m in _TYPE_DEF_RE.finditer(content):
+                name_to_file[m.group(1)] = fpath
 
-    try:
-        pkg = json.loads(pkg_json_str)
-    except json.JSONDecodeError:
-        return None
+        for error_path, missing_name in missing_names:
+            # Normalize the error path (strip leading ./)
+            norm_path = error_path.lstrip("./")
+            if norm_path not in files:
+                continue
+            if missing_name not in name_to_file:
+                continue
+            source_file = name_to_file[missing_name]
+            if source_file == norm_path:
+                continue  # defined in same file, different issue
 
-    deps = pkg.get("dependencies", {})
-    added = []
-    for mod in missing_modules:
-        # Extract the package name (handle scoped packages)
-        pkg_name = mod if mod.startswith("@") else mod.split("/")[0]
-        if pkg_name not in deps:
-            deps[pkg_name] = "latest"
-            added.append(pkg_name)
+            # Compute relative import path
+            from_dir = os.path.dirname(norm_path)
+            rel = os.path.relpath(source_file, from_dir)
+            # Remove extension for TS imports
+            rel = re.sub(r"\.(tsx?|jsx?)$", "", rel)
+            if not rel.startswith("."):
+                rel = "./" + rel
 
-    if not added:
-        return None
+            content = files[norm_path]
+            # Check if already imported from that path
+            if rel in content:
+                continue
 
-    pkg["dependencies"] = deps
-    log_detail(f"Mechanical fix: adding missing packages to package.json: {', '.join(added)}")
-    return {"package.json": json.dumps(pkg, indent=2)}
+            # Also check @/ alias path
+            alias_path = "@/" + source_file
+            alias_path = re.sub(r"\.(tsx?|jsx?)$", "", alias_path)
+            if alias_path in content:
+                continue
+
+            # Ensure the source file actually exports the name
+            source_content = files[source_file]
+            if f"export " not in source_content:
+                # Add export to the type definition in the source file
+                source_content = re.sub(
+                    rf"^(type|interface|enum|class)\s+{re.escape(missing_name)}\b",
+                    rf"export \1 {missing_name}",
+                    source_content,
+                    count=1,
+                    flags=re.MULTILINE,
+                )
+                patches[source_file] = source_content
+
+            import_line = f'import {{ {missing_name} }} from "{rel}";\n'
+            content = import_line + content
+            patches[norm_path] = content
+            log_detail(f"Mechanical fix: added import of {missing_name} from {rel} in {norm_path}")
+
+    return patches if patches else None
 
 
 def _build_fix_history_text(fix_history: list[dict]) -> str:
@@ -719,19 +781,20 @@ def fix_node(state: FactoryState) -> dict:
     }
 
 
-def _print_summary(state: FactoryState) -> None:
-    """Print a run summary with per-step timings and model stats."""
+def _build_summary(state: FactoryState) -> str:
+    """Build a run summary string with per-step timings and model stats."""
     timings = state.get("step_timings", [])
     pipeline_start = state.get("pipeline_start", 0)
     total_elapsed = time.monotonic() - pipeline_start if pipeline_start else 0
 
-    print("\n" + "=" * 70)
-    print("RUN SUMMARY")
-    print("=" * 70)
+    lines: list[str] = []
+    lines.append("=" * 70)
+    lines.append("RUN SUMMARY")
+    lines.append("=" * 70)
 
     # Per-step table
-    print(f"\n{'Step':<20} {'Time':>8} {'Tokens':>8} {'tok/s':>8} {'Model':<25} {'Notes'}")
-    print("-" * 90)
+    lines.append(f"\n{'Step':<20} {'Time':>8} {'Tokens':>8} {'tok/s':>8} {'Model':<25} {'Notes'}")
+    lines.append("-" * 90)
     for t in timings:
         node = t["node"]
         elapsed = f"{t['elapsed_s']:.1f}s"
@@ -760,7 +823,7 @@ def _print_summary(state: FactoryState) -> None:
         if t.get("finish_reason") and t["finish_reason"] != "stop":
             notes_parts.append(f"finish={t['finish_reason']}")
         notes = ", ".join(notes_parts)
-        print(f"{node:<20} {elapsed:>8} {tokens:>8} {tok_s:>8} {model:<25} {notes}")
+        lines.append(f"{node:<20} {elapsed:>8} {tokens:>8} {tok_s:>8} {model:<25} {notes}")
 
     # Aggregate model stats
     model_stats: dict[str, dict] = {}
@@ -775,30 +838,45 @@ def _print_summary(state: FactoryState) -> None:
         model_stats[model]["calls"] += 1
 
     if model_stats:
-        print(f"\n{'Model':<30} {'Calls':>6} {'Tokens':>10} {'Total Time':>12} {'Avg tok/s':>10}")
-        print("-" * 70)
+        lines.append(f"\n{'Model':<30} {'Calls':>6} {'Tokens':>10} {'Total Time':>12} {'Avg tok/s':>10}")
+        lines.append("-" * 70)
         for model, ms in model_stats.items():
             avg_tok_s = ms["total_tokens"] / ms["total_time"] if ms["total_time"] > 0 else 0
-            print(f"{model:<30} {ms['calls']:>6} {ms['total_tokens']:>10,} {ms['total_time']:>11.1f}s {avg_tok_s:>9.1f}")
+            lines.append(f"{model:<30} {ms['calls']:>6} {ms['total_tokens']:>10,} {ms['total_time']:>11.1f}s {avg_tok_s:>9.1f}")
 
     # Overall
     build_attempts = sum(1 for t in timings if t["node"] == "build")
     fix_attempts = sum(1 for t in timings if t["node"] == "fix")
     gen_attempts = sum(1 for t in timings if t["node"] == "generate")
-    print(f"\nTotal pipeline time: {total_elapsed:.1f}s")
-    print(f"Generate attempts: {gen_attempts}  |  Fix attempts: {fix_attempts}  |  Build attempts: {build_attempts}")
-    print(f"Result: {'BUILD OK' if state.get('last_build_ok') else 'FAILED'}")
-    print(f"Project: {state.get('project_dir', 'N/A')}")
-    print("=" * 70)
+    lines.append(f"\nTotal pipeline time: {total_elapsed:.1f}s")
+    lines.append(f"Generate attempts: {gen_attempts}  |  Fix attempts: {fix_attempts}  |  Build attempts: {build_attempts}")
+    lines.append(f"Result: {'BUILD OK' if state.get('last_build_ok') else 'FAILED'}")
+    lines.append(f"Project: {state.get('project_dir', 'N/A')}")
+    lines.append("=" * 70)
+
+    return "\n".join(lines)
+
+
+def _emit_summary(state: FactoryState) -> None:
+    """Print run summary to stdout and write to summary.txt in the project dir."""
+    summary = _build_summary(state)
+    print("\n" + summary)
+
+    project_dir = state.get("project_dir")
+    if project_dir:
+        summary_path = os.path.join(project_dir, "summary.txt")
+        with open(summary_path, "w", encoding="utf-8") as f:
+            f.write(summary + "\n")
+        log_detail(f"Summary written to {summary_path}")
 
 
 def done_node(state: FactoryState) -> dict:
-    _print_summary(state)
+    _emit_summary(state)
     return {}
 
 
 def fail_node(state: FactoryState) -> dict:
-    _print_summary(state)
+    _emit_summary(state)
     raise RuntimeError(
         "Failed to reach a successful pnpm build within retry limits.\n\n"
         f"Project dir: {state.get('project_dir')}\n\n"
