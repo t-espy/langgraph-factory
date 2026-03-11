@@ -1,0 +1,49 @@
+Sample run output: blog_markdown.py (2026-03-11)
+================================================
+
+======================================================================
+RUN SUMMARY
+======================================================================
+
+Step                     Time   Tokens    tok/s Model                     Notes
+------------------------------------------------------------------------------------------
+policy                  27.1s      361     13.3 gpt-oss
+scaffold                 3.1s                                             13 files
+manifest                68.0s      640      9.4 qwen3-coder-next          14 planned
+review_manifest         29.5s       86      2.9 gpt-oss
+generate                95.5s     4010     42.0 qwen3-coder-next          24 files, 141,527 chars
+install                  1.6s                                             OK
+build                    6.4s                                             FAILED
+review                   3.6s      111     31.1 gpt-oss
+fix                     24.2s      716     29.5 qwen3-coder-next          patched: src/lib/comments.ts, src/lib/posts.ts
+install                  0.0s                                             skipped
+build                    7.3s                                             attempt 2, OK
+
+Model                           Calls     Tokens   Total Time  Avg tok/s
+----------------------------------------------------------------------
+gpt-oss                             3        558        60.2s       9.3
+qwen3-coder-next                    3      5,366       187.7s      28.6
+
+Total pipeline time: 266.3s
+Generate attempts: 1  |  Fix attempts: 1  |  Build attempts: 2
+Result: BUILD OK
+======================================================================
+
+Build failure was 2 ESLint errors (let → const) in data store files.
+Reviewer diagnosed in 3.6s, coder fixed both in 24.2s. Second build passed.
+
+Generated files (14 app-specific + 13 scaffold):
+  src/app/layout.tsx
+  src/app/globals.css
+  src/app/page.tsx
+  src/app/posts/[slug]/page.tsx
+  src/app/admin/posts/page.tsx
+  src/app/admin/posts/new/page.tsx
+  src/app/admin/posts/[id]/edit/page.tsx
+  src/app/api/posts/route.ts
+  src/app/api/admin/posts/route.ts
+  src/app/api/admin/posts/[id]/route.ts
+  src/app/api/posts/[slug]/comments/route.ts
+  src/lib/posts.ts
+  src/lib/comments.ts
+  src/lib/markdown.ts
