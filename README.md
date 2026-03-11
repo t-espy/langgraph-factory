@@ -182,4 +182,6 @@ This pipeline is token-heavy — a single run can consume 6,000-40,000+ tokens a
 
 **Own the hardware:** The DGX Spark used here lists at $4,699 direct from NVIDIA. At $1.50/hr cloud GPU rates, it pays for itself after ~3,100 hours of usage. If you're running local models regularly, the amortized cost approaches zero.
 
-The broader point: pipelines like this generate a lot of tokens that never reach a user — reviewer reasoning, failed generations, fix attempts, regeneration context. Per-token pricing charges you for all of that. Local or rented GPU gives you a flat rate to experiment freely.
+**Data privacy:** With local or rented GPU, your prompts and generated code never leave your infrastructure. Nothing is sent to a third-party API, nothing is logged by a provider, nothing can end up in someone else's training data. For proprietary codebases, regulated industries, or anything you wouldn't paste into a web form, this matters. Per-token cloud APIs have varying data retention and training policies — read the fine print.
+
+The broader point: pipelines like this generate a lot of tokens that never reach a user — reviewer reasoning, failed generations, fix attempts, regeneration context. Per-token pricing charges you for all of that, and sends all of it through a third party's servers. Local or rented GPU gives you a flat rate to experiment freely, with full control over your data.
