@@ -157,4 +157,4 @@ Things worth studying:
 - How the scaffold node anchors generation on a known-good starting point
 - How failure context flows back into regeneration prompts
 
-The hardware used for development was an NVIDIA DGX Spark (GB10 GPU, 128GB unified RAM) running Docker Model Runner. Any machine with a GPU should work — gpt-oss 20B needs ~12GB VRAM and qwen3-coder needs ~8GB, so a 24GB GPU (RTX 3090/4090) can run both. The pipeline just talks to an OpenAI-compatible HTTP endpoint, so you can swap in Ollama, LM Studio, or any other backend by pointing `DMR_BASE_URL` at it in `config.py`.
+The hardware used for development was an NVIDIA DGX Spark (GB10 GPU, 128GB unified RAM) running Docker Model Runner. The models are large — qwen3-coder is 80B parameters (~45GB Q4) and gpt-oss is 20B (~11GB Q4) — so you need substantial GPU memory to run both. The pipeline just talks to an OpenAI-compatible HTTP endpoint, so you can swap in different models or backends (Ollama, LM Studio, etc.) by pointing `DMR_BASE_URL` at it in `config.py`.
