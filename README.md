@@ -97,6 +97,8 @@ curl http://localhost:12434/engines/v1/models
 ### Install and run
 
 ```bash
+git clone <this-repo> langgraph-factory
+cd langgraph-factory
 pip install -r requirements.txt
 ```
 
@@ -141,6 +143,7 @@ examples/
 tests/
 ├── test_factory_functions.py # Unit tests for recovery/validation logic
 └── test_utils.py             # Unit tests for parsing and extraction
+run_all_specs.sh              # Run all example specs and collect results
 ```
 
 ## What this is (and isn't)
@@ -154,4 +157,4 @@ Things worth studying:
 - How the scaffold node anchors generation on a known-good starting point
 - How failure context flows back into regeneration prompts
 
-The hardware used for development was an NVIDIA DGX Spark (GB10 GPU, 128GB unified RAM) running Docker Model Runner. Any machine with a GPU and enough VRAM for the models should work — the pipeline just talks to an OpenAI-compatible HTTP endpoint.
+The hardware used for development was an NVIDIA DGX Spark (GB10 GPU, 128GB unified RAM) running Docker Model Runner. Any machine with a GPU should work — gpt-oss 20B needs ~12GB VRAM and qwen3-coder needs ~8GB, so a 24GB GPU (RTX 3090/4090) can run both. The pipeline just talks to an OpenAI-compatible HTTP endpoint, so you can swap in Ollama, LM Studio, or any other backend by pointing `DMR_BASE_URL` at it in `config.py`.
