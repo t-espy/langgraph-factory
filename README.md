@@ -180,6 +180,6 @@ This pipeline is token-heavy — a single run can consume 6,000-40,000+ tokens a
 
 **Rent a GPU (vast.ai, RunPod, etc.):** An 80GB A100 rents for roughly $1-2/hr. You get unlimited tokens at whatever speed the hardware delivers. A 5-minute run costs ~$0.10-0.15 in GPU time regardless of token count, and regenerations are free. For iterative development work — where you're running the pipeline repeatedly to tune prompts and fix recovery logic — this is substantially cheaper than per-token pricing.
 
-**Own the hardware:** The DGX Spark used here lists at ~$3,999. At $1.50/hr cloud GPU rates, it pays for itself after ~2,700 hours of usage. If you're running local models regularly, the amortized cost approaches zero.
+**Own the hardware:** The DGX Spark used here lists at $4,699 direct from NVIDIA. At $1.50/hr cloud GPU rates, it pays for itself after ~3,100 hours of usage. If you're running local models regularly, the amortized cost approaches zero.
 
 The broader point: pipelines like this generate a lot of tokens that never reach a user — reviewer reasoning, failed generations, fix attempts, regeneration context. Per-token pricing charges you for all of that. Local or rented GPU gives you a flat rate to experiment freely.
