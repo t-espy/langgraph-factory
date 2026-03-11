@@ -185,3 +185,20 @@ This pipeline is token-heavy — a single run can consume 6,000-40,000+ tokens a
 **Data privacy:** With local or rented GPU, your prompts and generated code never leave your infrastructure. Nothing is sent to a third-party API, nothing is logged by a provider, nothing can end up in someone else's training data. For proprietary codebases, regulated industries, or anything you wouldn't paste into a web form, this matters. Per-token cloud APIs have varying data retention and training policies — read the fine print.
 
 The broader point: pipelines like this generate a lot of tokens that never reach a user — reviewer reasoning, failed generations, fix attempts, regeneration context. Per-token pricing charges you for all of that, and sends all of it through a third party's servers. Local or rented GPU gives you a flat rate to experiment freely, with full control over your data.
+
+## What we didn't cover
+
+This is a focused demo, not a comprehensive framework. Plenty of things that would matter in a real system are left as exercises for the reader:
+
+- **Other frameworks and languages** — the pipeline generates Next.js because that's what we tested. The patterns (decompose → generate → build → fix) apply to any framework with a CLI build step. Swap out the scaffold command, adjust the prompts, and the same architecture works for Django, Rails, Spring Boot, or anything else with a compiler or linter to close the feedback loop.
+- **Persistent storage** — everything uses in-memory stores. A real app would need database setup, migrations, and schema generation as pipeline nodes.
+- **Authentication and authorization** — not even attempted. Adding auth scaffolding (NextAuth, Clerk, etc.) would be another node in the graph.
+- **Testing** — the pipeline checks "does it build?" but doesn't generate or run tests. Adding a test generation node and a test runner after the build step is an obvious next step.
+- **Deployment** — the pipeline produces a buildable project and stops. CI/CD, containerization, and deployment are out of scope.
+- **Model selection** — we used two specific models because they were available and worked. The quality of the output depends heavily on the models. Better models will produce fewer fix cycles; smaller models may need more recovery layers or tighter prompt constraints.
+- **Prompt engineering** — the prompts in `factory.py` evolved through trial and error on two specs. They encode specific workarounds for specific model behaviors (qwen3-coder's shadcn habit, marked() type issues). Different models will have different failure modes and need different prompt tuning.
+- **Parallel generation** — files are generated in a single monolithic LLM call. Generating files in parallel (one call per file or per group) would be faster but adds coordination complexity around shared types and imports.
+- **Streaming output** — the pipeline blocks until each node completes. A production system would want to stream progress to a UI.
+- **Cost tracking** — token counts are logged but not aggregated into cost estimates. Easy to add if you know your per-token rate.
+
+The goal was to demonstrate the multi-agent pattern clearly, not to handle every edge case. Fork it, break it, make it do something different.
