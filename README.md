@@ -99,7 +99,7 @@ curl http://localhost:12434/engines/v1/models
 ```bash
 git clone <this-repo> langgraph-factory
 cd langgraph-factory
-pip install -r requirements.txt
+pip install -e .
 ```
 
 ```python
