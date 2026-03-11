@@ -232,7 +232,7 @@ def extract_referenced_paths(build_log: str, project_dir: str | None = None) -> 
     if not build_log:
         return []
     pattern = re.compile(
-        r"([A-Za-z0-9_./\\-]+\.(?:ts|tsx|js|jsx|json|mjs|cjs|cts|mts|css|scss|mdx))"
+        r"([A-Za-z0-9_./\\-]+\.(?:tsx|ts|jsx|js|json|mjs|cjs|cts|mts|scss|css|mdx))"
     )
     matches = pattern.findall(build_log)
     normalized = []

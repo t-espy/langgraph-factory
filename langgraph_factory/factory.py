@@ -183,7 +183,7 @@ def policy_node(state: FactoryState) -> dict:
     })
     out, stats = dmr_chat_json(
         model=FOREMAN_MODEL, system=system, user=user,
-        max_tokens=3000, temperature=0.4,
+        max_tokens=8000, temperature=0.4,
         label="policy",
     )
     contract = out.get("architecture_contract", {})
@@ -726,8 +726,10 @@ def generate_node(state: FactoryState) -> dict:
         "Always cast the result: `marked(markdown) as string` or use `marked.parse(markdown) as string`. "
         "Do NOT declare a synchronous return type `: string` on a function that calls marked() without casting.\n"
         "- ESLint: Use `const` instead of `let` when the variable is never reassigned. "
-        "Prefix unused catch parameters with underscore: `catch (_error)`. "
+        "For unused catch parameters, omit the parameter entirely: `catch {` (NOT `catch (error)` or `catch (_error)`). "
         "Remove unused imports and variables.\n"
+        "- Next.js 14 params: In Next.js 14, route params are a plain object — access `params.id` directly. "
+        "Do NOT use `React.use(params)` or `use(params.id)` — that is a Next.js 15 pattern and will cause type errors.\n"
         "- ESLint no-explicit-any: NEVER use `any` as a type. Use specific types: "
         "`React.FormEvent<HTMLFormElement>` for form submit handlers, "
         "`React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>` for input handlers, "
@@ -825,6 +827,32 @@ def generate_node(state: FactoryState) -> dict:
         raise RuntimeError("Generate step returned no files in fence format")
 
     log_detail(f"Generated {len(generated_files)} files")
+
+    # Detect degenerate output: if we got far fewer files than the manifest
+    # planned, the model likely went off the rails (e.g. CSS repetition loop)
+    manifest = state.get("manifest", [])
+    expected_count = len(manifest) if manifest else 3  # minimum sanity
+    if stats and stats.finish_reason == "length" and len(generated_files) < expected_count // 2:
+        log_detail(
+            f"WARNING: degenerate generation — {len(generated_files)} files vs "
+            f"{expected_count} expected, finish_reason=length. Discarding output."
+        )
+        # If this is a retry, we've exhausted our attempts
+        if gen_attempt >= MAX_GENERATE_ATTEMPTS:
+            raise RuntimeError(
+                f"Generate step produced degenerate output on attempt {gen_attempt} "
+                f"({len(generated_files)} files, finish_reason=length). Giving up."
+            )
+        # Otherwise, record the attempt and let the graph retry
+        timings = _record_step(state, "generate", elapsed, stats,
+                               files=len(generated_files), attempt=gen_attempt,
+                               degenerate=True)
+        return {
+            "generate_attempt": gen_attempt, "fix_attempt": 0,
+            "step_timings": timings,
+            "last_build_ok": False,
+            "last_build_log": f"Degenerate generation: {len(generated_files)} files, expected {expected_count}",
+        }
 
     # Merge with scaffold: scaffold provides the base, generated files overlay
     if has_scaffold:
@@ -1217,6 +1245,93 @@ def _try_mechanical_fix(build_log: str, files: dict[str, str]) -> tuple[dict[str
 
             patches[fpath] = content
 
+    # --- Fix 4: unused catch variables ---
+    # ESLint flags both `catch (error)` and `catch (_error)` as unused.
+    # The correct fix is to omit the parameter: `catch {`
+    unused_catch_vars = re.findall(
+        r"^\./([^:]+):\d+:\d+\s+Error:\s+'(_?\w+)'\s+is defined but never used\.\s+@typescript-eslint/no-unused-vars",
+        build_log, re.MULTILINE,
+    )
+    if unused_catch_vars:
+        # Group by file
+        catch_fixes_by_file: dict[str, set[str]] = {}
+        for fpath, var_name in unused_catch_vars:
+            catch_fixes_by_file.setdefault(fpath, set()).add(var_name)
+
+        for fpath, var_names in catch_fixes_by_file.items():
+            if fpath not in files:
+                continue
+            content = patches.get(fpath, files[fpath])
+            changed = False
+            for var_name in var_names:
+                # Remove unused catch parameter: catch (error) { → catch {
+                new_content = re.sub(
+                    rf"\bcatch\s*\(\s*{re.escape(var_name)}\s*(?::\s*\w+)?\s*\)",
+                    "catch",
+                    content,
+                )
+                # Remove unused import: import { X } from "...";
+                if new_content == content:
+                    new_content = re.sub(
+                        rf"^import\s+\{{[^}}]*\b{re.escape(var_name)}\b[^}}]*\}}\s+from\s+['\"][^'\"]+['\"];?\s*\n",
+                        "",
+                        content,
+                        flags=re.MULTILINE,
+                    )
+                if new_content != content:
+                    content = new_content
+                    changed = True
+            if changed:
+                patches[fpath] = content
+                log_detail(f"Mechanical fix: removed unused catch params/imports in {fpath}")
+
+    # --- Fix 5: unused standalone imports ---
+    # e.g. "'NextRequest' is defined but never used"
+    unused_imports = re.findall(
+        r"^\./([^:]+):\d+:\d+\s+Error:\s+'(\w+)'\s+is defined but never used\.\s+@typescript-eslint/no-unused-vars",
+        build_log, re.MULTILINE,
+    )
+    if unused_imports:
+        imports_by_file: dict[str, set[str]] = {}
+        for fpath, var_name in unused_imports:
+            imports_by_file.setdefault(fpath, set()).add(var_name)
+
+        for fpath, var_names in imports_by_file.items():
+            if fpath not in files:
+                continue
+            content = patches.get(fpath, files[fpath])
+            changed = False
+            for var_name in var_names:
+                # Skip if already handled by catch fix
+                if fpath in catch_fixes_by_file and var_name in catch_fixes_by_file.get(fpath, set()):
+                    continue
+                # Remove the name from a multi-import: import { A, B } from "..."
+                # If it's the only import, remove the whole line
+                # Single import: import { NextRequest } from "next/server";
+                single_import = re.compile(
+                    rf"^import\s+\{{\s*{re.escape(var_name)}\s*\}}\s+from\s+['\"][^'\"]+['\"];?\s*\n",
+                    re.MULTILINE,
+                )
+                if single_import.search(content):
+                    content = single_import.sub("", content)
+                    changed = True
+                else:
+                    # Multi-import: remove just this name from { A, B, C }
+                    # "var_name, " or ", var_name"
+                    new_content = re.sub(
+                        rf"\b{re.escape(var_name)}\s*,\s*", "", content,
+                    )
+                    if new_content == content:
+                        new_content = re.sub(
+                            rf",\s*{re.escape(var_name)}\b", "", content,
+                        )
+                    if new_content != content:
+                        content = new_content
+                        changed = True
+            if changed:
+                patches[fpath] = content
+                log_detail(f"Mechanical fix: removed unused imports in {fpath}")
+
     if not patches and not removals:
         return None
     return patches, removals
@@ -1296,7 +1411,8 @@ def fix_node(state: FactoryState) -> dict:
         "KNOWN FIX PATTERNS:\n"
         "- marked() returns string | Promise<string>. Cast it: `marked(markdown) as string`. "
         "Do NOT make wrapper functions async just to handle this — cast instead.\n"
-        "- ESLint 'defined but never used': prefix with underscore (`_error`) or remove.\n"
+        "- ESLint 'defined but never used': remove the catch parameter entirely — use `catch {` instead of `catch (error)`. "
+        "For unused imports, delete the import line.\n"
         "- ESLint 'never reassigned, use const': change `let` to `const`.\n"
         "- 'X is possibly undefined': add a guard `if (!x) return notFound();` or `if (!x) throw ...` before usage."
     )
@@ -1625,6 +1741,18 @@ def review_node(state: FactoryState) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def decide_after_generate(state: FactoryState) -> str:
+    """Route after generate: write if files present, fail if degenerate."""
+    files = state.get("files")
+    if files:
+        return "write"
+    # No files means degenerate output — check if we can retry
+    gen_attempt = state.get("generate_attempt", 0)
+    if gen_attempt < MAX_GENERATE_ATTEMPTS:
+        return "regenerate"
+    return "fail"
+
+
 def decide_after_build(state: FactoryState) -> str:
     """Route after build: success → done, failure → review."""
     if state.get("last_build_ok"):
@@ -1676,7 +1804,15 @@ def build_factory_graph():
     g.add_edge("manifest", "review_manifest")
     g.add_edge("review_manifest", "generate")
 
-    g.add_edge("generate", "write")
+    g.add_conditional_edges(
+        "generate",
+        decide_after_generate,
+        {
+            "write": "write",
+            "regenerate": "generate",
+            "fail": "fail",
+        },
+    )
     g.add_edge("write", "install")
     g.add_edge("install", "build")
 
