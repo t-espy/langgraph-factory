@@ -2,7 +2,6 @@
 
 import json
 import sys
-import threading
 import time
 from dataclasses import dataclass, field
 
@@ -11,9 +10,7 @@ from pydantic import SecretStr
 from langchain_openai import ChatOpenAI
 
 from langgraph_factory.config import DMR_BASE_URL, DMR_API_KEY
-from langgraph_factory.utils import extract_json
-
-_print_lock = threading.Lock()
+from langgraph_factory.utils import extract_json, tee_print
 
 
 @dataclass
@@ -58,8 +55,7 @@ def langchain_chat(model: str, system: str, user: str, temperature: float = 0.2)
 
 def _print_progress(msg: str) -> None:
     """Print and flush immediately, thread-safe."""
-    with _print_lock:
-        print(msg, flush=True)
+    tee_print(msg)
 
 
 def _dmr_stream(
@@ -98,12 +94,41 @@ def _dmr_stream(
         f"prompt={prompt_chars:,} chars  max_tokens={max_tokens}"
     )
 
+    MAX_RETRIES = 3
     start = time.monotonic()
-    r = requests.post(
-        url, headers=headers, data=json.dumps(payload),
-        timeout=1800, stream=True,
-    )
-    r.raise_for_status()
+    last_exc: Exception | None = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            r = requests.post(
+                url, headers=headers, data=json.dumps(payload),
+                timeout=1800, stream=True,
+            )
+            r.raise_for_status()
+            break
+        except requests.exceptions.HTTPError as e:
+            last_exc = e
+            status = e.response.status_code if e.response is not None else "?"
+            _print_progress(
+                f"{tag} HTTP {status} on attempt {attempt}/{MAX_RETRIES}"
+            )
+            if attempt < MAX_RETRIES:
+                wait = 5 * attempt
+                _print_progress(f"{tag} retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                _print_progress(f"{tag} all {MAX_RETRIES} attempts failed")
+                raise
+        except requests.exceptions.ConnectionError as e:
+            last_exc = e
+            _print_progress(
+                f"{tag} connection error on attempt {attempt}/{MAX_RETRIES}: {e}"
+            )
+            if attempt < MAX_RETRIES:
+                wait = 5 * attempt
+                _print_progress(f"{tag} retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                raise
 
     content_parts: list[str] = []
     token_count = 0

@@ -29,11 +29,14 @@ from langgraph_factory.config import (
 )
 from langgraph_factory.llm import LLMStats, dmr_chat_json, dmr_chat_raw
 from langgraph_factory.utils import (
+    close_log_file,
     extract_referenced_paths,
+    init_log_file,
     log_detail,
     log_step,
     normalize_path,
     parse_fenced_files,
+    tee_print,
 )
 
 
@@ -42,6 +45,7 @@ class FactoryState(TypedDict, total=False):
     architecture_contract: dict
     acceptance: list[str]
     manifest: list[dict]
+    scaffold_files: dict[str, str]  # pristine scaffold from create-next-app
     files: dict[str, str]
     last_build_ok: bool
     last_build_log: str
@@ -106,10 +110,10 @@ def _log_build_failure(
     lines = (build_log or "").splitlines()
     head = lines[:60]
     tail = lines[-200:] if len(lines) > 200 else lines
-    print("[detail] build log (first 60 lines)")
-    print("\n".join(head))
-    print("[detail] build log (last 200 lines)")
-    print("\n".join(tail))
+    tee_print("[detail] build log (first 60 lines)")
+    tee_print("\n".join(head))
+    tee_print("[detail] build log (last 200 lines)")
+    tee_print("\n".join(tail))
     if patched_files:
         log_detail(f"Patched files: {', '.join(patched_files)}")
 
@@ -121,6 +125,10 @@ def _log_build_failure(
 
 def policy_node(state: FactoryState) -> dict:
     """Generate an architecture contract from the app spec."""
+    # Initialize log file at the start of the pipeline
+    project_dir = state.get("project_dir")
+    if project_dir:
+        init_log_file(project_dir)
     log_step("Generate architecture policy")
     t0 = time.monotonic()
 
@@ -137,6 +145,9 @@ def policy_node(state: FactoryState) -> dict:
             "Package manager must be pnpm.",
             "In-memory storage acceptable for MVP.",
             "Goal: pnpm build must pass.",
+            "Include a library_notes section with correct usage patterns for any "
+            "third-party npm packages the app will need. This is critical — the "
+            "coder model will follow these notes exactly.",
         ],
         "output_schema": {
             "architecture_contract": {
@@ -145,12 +156,8 @@ def policy_node(state: FactoryState) -> dict:
                 "package_manager": "pnpm",
                 "import_aliases": {"@/*": "./src/*"},
                 "ui_strategy": {
-                    "mode": "no_ui_imports | local_primitives",
-                    "allowed_import_prefixes": ["@/components/ui/"],
-                    "primitives": [
-                        "button", "input", "label", "card",
-                        "table", "textarea", "select",
-                    ],
+                    "mode": "no_ui_imports",
+                    "note": "Use plain HTML elements with Tailwind CSS. No component wrappers.",
                 },
                 "entity": {
                     "name": "Product",
@@ -165,6 +172,10 @@ def policy_node(state: FactoryState) -> dict:
                 "server_client_rules": {
                     "prefer_server_components": "boolean",
                     "use_client_only_for_forms": "boolean",
+                },
+                "library_notes": {
+                    "marked": "marked() returns string | Promise<string>. Always cast: marked(content) as string. Never use async/await for marked.",
+                    "<pkg>": "usage notes for any other third-party packages",
                 },
                 "acceptance": ["pnpm build"],
             },
@@ -185,6 +196,12 @@ def policy_node(state: FactoryState) -> dict:
     }
 
 
+# Files provided by the scaffold that the coder should NOT regenerate
+_SCAFFOLD_ONLY_FILES = frozenset({
+    "package.json", "tsconfig.json", "next.config.mjs", "next.config.ts",
+    "tailwind.config.ts", "postcss.config.mjs", ".eslintrc.json",
+})
+
 _REQUIRED_FILES = {"package.json", "tsconfig.json"}
 _REQUIRED_PATTERNS = {
     "next.config": lambda p: p.startswith("next.config.") and not p.endswith(".ts"),
@@ -195,45 +212,92 @@ _REQUIRED_PATTERNS = {
 MAX_MANIFEST_ATTEMPTS = 2
 
 
-def _validate_manifest(manifest: list[dict]) -> list[str]:
-    """Check manifest for required files. Returns list of issues."""
+def _validate_manifest(manifest: list[dict], has_scaffold: bool = False) -> list[str]:
+    """Check manifest for required files. Returns list of issues.
+
+    When a scaffold exists, config files and layout are already provided,
+    so we only validate app-specific files.
+    """
     paths = {e.get("path", "") for e in manifest}
     issues = []
 
-    for required in _REQUIRED_FILES:
-        if required not in paths:
-            issues.append(f"missing {required}")
+    if not has_scaffold:
+        for required in _REQUIRED_FILES:
+            if required not in paths:
+                issues.append(f"missing {required}")
 
-    for name, check in _REQUIRED_PATTERNS.items():
-        if not any(check(p) for p in paths):
-            issues.append(f"missing {name} file")
+        for name, check in _REQUIRED_PATTERNS.items():
+            if not any(check(p) for p in paths):
+                issues.append(f"missing {name} file")
 
-    # Check for the bad next.config.ts
-    if any(p == "next.config.ts" for p in paths):
-        issues.append("next.config.ts present — must be .mjs or .js (Next.js 14)")
+        # Check for the bad next.config.ts
+        if any(p == "next.config.ts" for p in paths):
+            issues.append("next.config.ts present — must be .mjs or .js (Next.js 14)")
+
+    # Always require at least one page
+    if not any(p.endswith(("page.tsx", "page.jsx")) for p in paths):
+        issues.append("missing page file")
+
+    # Warn if scaffold exists but manifest includes config files
+    if has_scaffold:
+        config_in_manifest = [p for p in paths if p in _SCAFFOLD_ONLY_FILES]
+        if config_in_manifest:
+            issues.append(
+                f"scaffold already provides these — remove from manifest: {', '.join(config_in_manifest)}"
+            )
 
     return issues
 
 
 def _build_manifest_prompt(state: FactoryState, issues: list[str] | None = None):
     """Build manifest system/user prompts, optionally including prior issues."""
+    scaffold_files = state.get("scaffold_files", {})
+    has_scaffold = bool(scaffold_files)
+
     system = (
         "You are a senior software architect planning a Next.js App Router project. "
         "Return STRICT JSON only. "
         'Schema: {"files": [{"path": "relative/path", "description": "what this file does", '
         '"imports_from": ["other/project/paths"], '
         '"category": "config|lib|style|component|page|api"}]} '
-        "List EVERY file needed for pnpm install and pnpm build to pass. "
-        "imports_from lists other files IN THIS PROJECT that this file will import. "
-        "IMPORTANT: Use next.config.mjs (NOT next.config.ts)."
     )
-    constraints = [
-        "Include all config files: package.json, tsconfig.json, next.config.mjs.",
-        "Include a root layout file (e.g. src/app/layout.tsx or app/layout.tsx) — Next.js requires this.",
+
+    if has_scaffold:
+        scaffold_listing = ", ".join(sorted(scaffold_files.keys()))
+        system += (
+            "A project scaffold has already been created via create-next-app. "
+            f"These files ALREADY EXIST and must NOT appear in your manifest: {scaffold_listing}. "
+            "Plan ONLY the app-specific files that need to be ADDED or REPLACED: "
+            "pages, API routes, lib utilities, components, and styles. "
+            "You may include src/app/layout.tsx and src/app/globals.css if the app needs "
+            "custom layout or styles (they will replace the scaffold defaults). "
+            "Do NOT plan config files (package.json, tsconfig.json, next.config.mjs, "
+            "tailwind.config.ts, postcss.config.mjs, .eslintrc.json). "
+            "Do NOT plan generic UI wrapper components (Button, Input, Card, etc.) — "
+            "use plain HTML elements with Tailwind CSS classes directly."
+        )
+    else:
+        system += (
+            "List EVERY file needed for pnpm install and pnpm build to pass. "
+            "IMPORTANT: Use next.config.mjs (NOT next.config.ts)."
+        )
+
+    system += " imports_from lists other files IN THIS PROJECT that this file will import."
+
+    constraints = []
+    if not has_scaffold:
+        constraints.append("Include all config files: package.json, tsconfig.json, next.config.mjs.")
+        constraints.append("Include a root layout file (e.g. src/app/layout.tsx or app/layout.tsx) — Next.js requires this.")
+    constraints.extend([
         "Include all source files: pages, lib, API routes, styles.",
         "imports_from should only reference paths within this project.",
         "Do NOT include file contents — only paths, descriptions, and metadata.",
-    ]
+    ])
+    if has_scaffold:
+        constraints.append(
+            "Do NOT include generic UI primitive wrappers (components/ui/button.tsx, etc.). "
+            "Use plain <button>, <input>, <select>, <table> HTML elements with Tailwind classes."
+        )
     if issues:
         constraints.append(
             f"PREVIOUS ATTEMPT HAD ISSUES — fix these: {'; '.join(issues)}"
@@ -251,6 +315,7 @@ def manifest_node(state: FactoryState) -> dict:
     log_step("Generate file manifest")
     t0 = time.monotonic()
     last_stats: LLMStats | None = None
+    has_scaffold = bool(state.get("scaffold_files"))
 
     issues: list[str] = []
     for attempt in range(1, MAX_MANIFEST_ATTEMPTS + 1):
@@ -272,7 +337,7 @@ def manifest_node(state: FactoryState) -> dict:
         for entry in manifest:
             log_detail(f"  {entry.get('category', '?'):10s}  {entry.get('path', '?')}")
 
-        issues = _validate_manifest(manifest)
+        issues = _validate_manifest(manifest, has_scaffold=has_scaffold)
         if not issues:
             log_detail("Manifest validation passed")
             elapsed = time.monotonic() - t0
@@ -293,6 +358,105 @@ def manifest_node(state: FactoryState) -> dict:
     timings = _record_step(state, "manifest", elapsed, last_stats,
                            files_planned=len(manifest), attempts=MAX_MANIFEST_ATTEMPTS,
                            issues=issues)
+    return {"manifest": manifest, "step_timings": timings}
+
+
+# ---------------------------------------------------------------------------
+# Manifest review (foreman)
+# ---------------------------------------------------------------------------
+
+
+def review_manifest_node(state: FactoryState) -> dict:
+    """Have the foreman (gpt-oss) review the manifest for quality and relevance.
+
+    Catches problems like unnecessary UI wrapper components, missing files,
+    or patterns that don't match the architecture policy.
+    """
+    log_step("Review manifest")
+    t0 = time.monotonic()
+
+    manifest = state.get("manifest", [])
+    contract = state.get("architecture_contract", {})
+    spec = _require_spec(state)
+
+    # Format manifest for the reviewer
+    manifest_summary = "\n".join(
+        f"  {e.get('category', '?'):10s}  {e.get('path', '?')}  — {e.get('description', '')}"
+        for e in manifest
+    )
+
+    has_scaffold = bool(state.get("scaffold_files"))
+    scaffold_note = ""
+    if has_scaffold:
+        scaffold_listing = ", ".join(sorted(state.get("scaffold_files", {}).keys()))
+        scaffold_note = (
+            f"\n\nIMPORTANT: A project scaffold (create-next-app) already provides these files: "
+            f"{scaffold_listing}. "
+            "The manifest should contain ONLY app-specific files (pages, API routes, lib, components). "
+            "If the manifest includes config files or generic UI wrappers that the scaffold already "
+            "provides, flag them for removal."
+        )
+
+    system = (
+        "You are a senior software architect reviewing a file manifest for a Next.js project.\n"
+        "Your job is to ensure the planned files are appropriate, necessary, and consistent with "
+        "the architecture policy.\n\n"
+        "Return STRICT JSON with this schema:\n"
+        '{"action": "approve" | "trim", "remove_paths": ["path/to/remove", ...], '
+        '"reasoning": "why", "warnings": ["optional notes for the coder"]}\n\n'
+        "Guidelines:\n"
+        "- Remove any files that duplicate framework functionality or create unnecessary abstractions.\n"
+        "- Remove generic UI wrapper components (components/ui/button.tsx, etc.) — "
+        "use plain HTML elements with Tailwind CSS classes directly.\n"
+        "- Keep files that are genuinely needed: pages, API routes, lib utilities, domain components.\n"
+        "- Config files should NOT be in the manifest if a scaffold provides them.\n"
+        "- When in doubt, keep the file — the build-fix loop can handle extras better than gaps."
+        + scaffold_note
+    )
+    user = json.dumps({
+        "app_spec": spec,
+        "architecture_contract": contract,
+        "manifest": manifest_summary,
+        "file_count": len(manifest),
+    })
+
+    out, stats = dmr_chat_json(
+        model=FOREMAN_MODEL, system=system, user=user,
+        max_tokens=8000, temperature=0.3,
+        label="manifest-review",
+    )
+
+    action = out.get("action", "approve")
+    remove_paths = out.get("remove_paths", [])
+    reasoning = out.get("reasoning", "")
+    warnings = out.get("warnings", [])
+
+    if action == "trim" and remove_paths:
+        # Filter out the removed paths
+        original_count = len(manifest)
+        protected = {"package.json", "tsconfig.json", "next.config.mjs", "next.config.js"}
+        safe_removals = [p for p in remove_paths if p not in protected]
+        manifest = [e for e in manifest if e.get("path") not in safe_removals]
+        log_detail(
+            f"Manifest review: trimmed {original_count - len(manifest)} files "
+            f"({original_count} → {len(manifest)})"
+        )
+        for p in safe_removals:
+            if p in {e.get("path") for e in state.get("manifest", [])}:
+                log_detail(f"  removed: {p}")
+        if set(remove_paths) - set(safe_removals):
+            log_detail(f"  protected (kept): {', '.join(set(remove_paths) - set(safe_removals))}")
+    else:
+        log_detail(f"Manifest review: approved ({len(manifest)} files)")
+
+    if reasoning:
+        log_detail(f"Reviewer reasoning: {reasoning}")
+    for w in warnings:
+        log_detail(f"Reviewer warning: {w}")
+
+    elapsed = time.monotonic() - t0
+    timings = _record_step(state, "review_manifest", elapsed, stats,
+                           action=action, removed=len(remove_paths) if remove_paths else 0)
     return {"manifest": manifest, "step_timings": timings}
 
 
@@ -369,16 +533,168 @@ def _reconcile_imports(files: dict[str, str]) -> dict[str, str]:
     return files
 
 
+def _sanitize_generated_files(files: dict[str, str]) -> dict[str, str]:
+    """Fix known generation issues before the first build.
+
+    Deterministic fixes applied post-generate to avoid wasting build cycles
+    on problems we've seen the model repeat.
+    """
+    files = dict(files)
+
+    # --- Fix: next.config.ts → next.config.mjs ---
+    # Next.js 14 does not support TypeScript config files.
+    if "next.config.ts" in files and "next.config.mjs" not in files:
+        content = files.pop("next.config.ts")
+        # Convert TS export syntax to ESM if needed
+        # e.g. "export default { ... }" is already valid ESM
+        # but "const config: NextConfig = ..." needs the type annotation stripped
+        content = re.sub(r":\s*NextConfig\b", "", content)
+        content = re.sub(r"import\s+type\s*\{[^}]*\}\s*from\s*['\"]next['\"];?\n?", "", content)
+        files["next.config.mjs"] = content
+        log_detail("Sanitize: renamed next.config.ts → next.config.mjs")
+
+    # --- Fix: missing root layout ---
+    # Next.js App Router requires a root layout.tsx in the app directory.
+    layout_paths = [p for p in files if re.match(r"^(src/)?app/layout\.(tsx?|jsx?)$", p)]
+    if not layout_paths:
+        # Determine if project uses src/ prefix
+        uses_src = any(p.startswith("src/") for p in files)
+        layout_path = "src/app/layout.tsx" if uses_src else "app/layout.tsx"
+        files[layout_path] = (
+            'import type {{ Metadata }} from "next";\n'
+            'import "./globals.css";\n'
+            "\n"
+            "export const metadata: Metadata = {{\n"
+            '  title: "App",\n'
+            '  description: "Generated by langgraph-factory",\n'
+            "}};\n"
+            "\n"
+            "export default function RootLayout({{\n"
+            "  children,\n"
+            "}}: {{\n"
+            "  children: React.ReactNode;\n"
+            "}}) {{\n"
+            "  return (\n"
+            '    <html lang="en">\n'
+            "      <body>{{children}}</body>\n"
+            "    </html>\n"
+            "  );\n"
+            "}}\n"
+        ).replace("{{", "{").replace("}}", "}")
+
+        # Also ensure globals.css exists if referenced
+        css_path = "src/app/globals.css" if uses_src else "app/globals.css"
+        if css_path not in files:
+            files[css_path] = "/* Global styles */\n"
+
+        log_detail(f"Sanitize: injected missing root layout at {layout_path}")
+
+    return files
+
+
+# ---------------------------------------------------------------------------
+# Scaffold (npx create-next-app)
+# ---------------------------------------------------------------------------
+
+
+def scaffold_node(state: FactoryState) -> dict:
+    """Run npx create-next-app to create a working project skeleton.
+
+    This gives us correct config files (package.json, tsconfig.json,
+    next.config.mjs, layout.tsx, globals.css, tailwind.config.ts) so
+    the coder only needs to add the actual app code on top.
+    """
+    log_step("Scaffold project via create-next-app")
+    t0 = time.monotonic()
+    project_dir = _require_project_dir(state)
+
+    # Use a temp directory for the scaffold, then read files
+    scaffold_dir = os.path.join(project_dir, "scaffold-tmp")
+    if os.path.exists(scaffold_dir):
+        shutil.rmtree(scaffold_dir)
+
+    cmd = [
+        "npx", "create-next-app@14",
+        scaffold_dir,
+        "--typescript",
+        "--tailwind",
+        "--app",
+        "--src-dir",
+        "--use-pnpm",
+        "--eslint",
+        "--import-alias", "@/*",
+    ]
+    log_detail(f"Running: {' '.join(cmd)}")
+    result = _run_cmd(cmd, cwd=project_dir)
+
+    if result.returncode != 0:
+        log_detail(f"Scaffold failed (exit {result.returncode}): {result.stdout[-500:]}")
+        # Fall through — generate node will create everything from scratch
+        elapsed = time.monotonic() - t0
+        timings = _record_step(state, "scaffold", elapsed, status="FAILED")
+        return {"step_timings": timings}
+
+    # Read all scaffold files into the files dict
+    scaffold_files: dict[str, str] = {}
+    for dirpath, dirnames, filenames in os.walk(scaffold_dir, topdown=True):
+        # Skip node_modules and .git
+        dirnames[:] = [d for d in dirnames if d not in {"node_modules", ".git", ".next"}]
+        for fname in filenames:
+            abs_path = os.path.join(dirpath, fname)
+            rel = os.path.relpath(abs_path, scaffold_dir)
+            try:
+                with open(abs_path, "r", encoding="utf-8") as f:
+                    scaffold_files[rel] = f.read()
+            except (UnicodeDecodeError, OSError):
+                continue  # skip binary files
+
+    # Clean up temp scaffold
+    shutil.rmtree(scaffold_dir, ignore_errors=True)
+
+    log_detail(f"Scaffold created {len(scaffold_files)} files")
+    for p in sorted(scaffold_files):
+        log_detail(f"  scaffold: {p}")
+
+    elapsed = time.monotonic() - t0
+    timings = _record_step(state, "scaffold", elapsed, files=len(scaffold_files))
+    return {"scaffold_files": scaffold_files, "files": scaffold_files, "step_timings": timings}
+
+
 # ---------------------------------------------------------------------------
 # Generate
 # ---------------------------------------------------------------------------
 
-
 def generate_node(state: FactoryState) -> dict:
-    """Generate the complete project in a single model call."""
+    """Generate the app-specific project files in a single model call.
+
+    Builds on top of the scaffold (if present) — the coder only needs to
+    produce pages, API routes, lib, and components. Config files come from
+    the scaffold and are merged afterward.
+    """
     gen_attempt = state.get("generate_attempt", 0) + 1
     log_step(f"Generate project — monolithic (attempt {gen_attempt})")
     t0 = time.monotonic()
+
+    scaffold_files = state.get("scaffold_files", {})
+    has_scaffold = bool(scaffold_files) and "package.json" in scaffold_files
+
+    if has_scaffold:
+        # List scaffold files so the coder knows what already exists
+        scaffold_listing = "\n".join(f"  {p}" for p in sorted(scaffold_files) if p not in _SCAFFOLD_ONLY_FILES)
+        scaffold_context = (
+            "A project scaffold has already been created via create-next-app with these files:\n"
+            f"{scaffold_listing}\n\n"
+            "IMPORTANT scaffold rules:\n"
+            "- Do NOT output package.json, tsconfig.json, next.config.mjs, tailwind.config.ts, "
+            "postcss.config.mjs, or .eslintrc.json — these already exist from the scaffold.\n"
+            "- You MUST output src/app/layout.tsx and src/app/globals.css to replace the scaffold defaults.\n"
+            "- You CAN add new npm dependencies — output a file called EXTRA_DEPS.json with "
+            '{"dependencies": {"pkg": "version"}, "devDependencies": {"pkg": "version"}} '
+            "and they will be merged into the scaffold package.json.\n"
+            "- All your files will be added ON TOP of the scaffold.\n"
+        )
+    else:
+        scaffold_context = ""
 
     system = (
         "You are a meticulous senior engineer generating a complete runnable project.\n"
@@ -386,54 +702,164 @@ def generate_node(state: FactoryState) -> dict:
         "===FILE: relative/path.ext===\n"
         "file contents here\n"
         "===END FILE===\n\n"
-        "Do not omit required config files; ensure pnpm build will succeed.\n"
+    )
+    if has_scaffold:
+        system += scaffold_context
+    else:
+        system += "Do not omit required config files; ensure pnpm build will succeed.\n"
+
+    system += (
         "Obey the architecture_contract strictly.\n"
-        "Every npm package you import MUST appear in package.json dependencies.\n"
+        "Every npm package you import MUST appear in package.json dependencies "
+        "(or in EXTRA_DEPS.json if a scaffold is present).\n"
         "Every file you import from within the project MUST be included in your output.\n"
         "If you create component files, they must export everything that other files import from them.\n"
         "Put shared TypeScript types and in-memory stores in a dedicated file (e.g. lib/types.ts, lib/store.ts) "
-        "and import from there — NEVER duplicate type definitions or stores across files."
+        "and import from there — NEVER duplicate type definitions or stores across files.\n"
+        "CRITICAL UI rules:\n"
+        "- Do NOT import from @radix-ui/* or use shadcn patterns unless the architecture_contract explicitly requires them.\n"
+        "- Do NOT create mock or wrapper files for third-party component libraries.\n"
+        "- UI components should use plain HTML elements (button, select, input, table) styled with Tailwind CSS.\n"
+        "- Keep component files short and simple — no component needs forwardRef, Slot, or Primitive patterns for an MVP.\n"
+        "KNOWN LIBRARY PITFALLS:\n"
+        "- The 'marked' package: marked() returns string | Promise<string>. "
+        "Always cast the result: `marked(markdown) as string` or use `marked.parse(markdown) as string`. "
+        "Do NOT declare a synchronous return type `: string` on a function that calls marked() without casting.\n"
+        "- ESLint: Use `const` instead of `let` when the variable is never reassigned. "
+        "Prefix unused catch parameters with underscore: `catch (_error)`. "
+        "Remove unused imports and variables.\n"
+        "- ESLint no-explicit-any: NEVER use `any` as a type. Use specific types: "
+        "`React.FormEvent<HTMLFormElement>` for form submit handlers, "
+        "`React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>` for input handlers, "
+        "`unknown` with type guards for catch blocks."
     )
 
-    user = json.dumps({
+    constraints = [
+        "Project must be Next.js App Router + TypeScript.",
+        "Keep it minimal but complete.",
+        "Derive ALL entity fields, pages, and routes from the app_spec and architecture_contract — do not hardcode or omit fields.",
+        "Sample/seed data must include every field defined in the entity type.",
+        "In-memory store is fine; prefer server components + route handlers or server actions.",
+        "Avoid external DB for MVP.",
+    ]
+    if not has_scaffold:
+        constraints.insert(1, "Provide all files required for pnpm install and pnpm build.")
+
+    # Include the manifest so the coder knows exactly what files to generate
+    manifest = state.get("manifest", [])
+    manifest_listing = [e.get("path", "") for e in manifest if e.get("path")]
+    if manifest_listing:
+        constraints.append(
+            f"Generate EXACTLY these files (no more, no fewer): {', '.join(manifest_listing)}. "
+            "Do NOT create files that are not in this list. "
+            "Do NOT create components/ui/ wrapper files unless they appear in this list."
+        )
+
+    user_payload: dict = {
         "app_spec": _require_spec(state),
         "architecture_contract": state.get("architecture_contract", {}),
-        "constraints": [
-            "Project must be Next.js App Router + TypeScript.",
-            "Provide all files required for pnpm install and pnpm build.",
-            "Keep it minimal but complete.",
-            "Derive ALL entity fields, pages, and routes from the app_spec and architecture_contract — do not hardcode or omit fields.",
-            "Sample/seed data must include every field defined in the entity type.",
-            "In-memory store is fine; prefer server components + route handlers or server actions.",
-            "Avoid external DB for MVP.",
+        "file_manifest": [
+            {"path": e.get("path"), "description": e.get("description", "")}
+            for e in manifest
         ],
+        "constraints": constraints,
         "output_requirements": [
             "Output ONLY ===FILE: path=== ... ===END FILE=== blocks.",
             "Every file must contain full, complete code (no placeholders).",
             "Do not reference files that you did not include.",
             "Honor ui_strategy mode in architecture_contract.",
+            "Do NOT wrap file contents in markdown code fences (```). Output raw code only.",
         ],
         "attempt": gen_attempt,
-    })
+    }
+
+    # On retry, feed failure context so the model doesn't repeat mistakes
+    if gen_attempt > 1:
+        fix_history = state.get("fix_history", [])
+        error_patterns = []
+        for entry in fix_history:
+            summary = entry.get("error_summary", "")
+            if summary:
+                error_patterns.append(summary)
+        seen = set()
+        unique_errors = []
+        for e in error_patterns:
+            key = e[:100]
+            if key not in seen:
+                seen.add(key)
+                unique_errors.append(e)
+
+        reviewer_verdict = state.get("review_verdict", {})
+        user_payload["previous_attempt_failures"] = {
+            "error_patterns": unique_errors[:5],
+            "reviewer_reasoning": reviewer_verdict.get("reasoning", ""),
+            "instructions": [
+                "The previous generation attempt failed to build after multiple fix attempts.",
+                "Avoid the error patterns listed above.",
+                "Ensure all component props interfaces are complete — include variant, size, asChild, and other common props.",
+                "Include a root layout.tsx in the app directory.",
+                "Every TypeScript lambda parameter must have an explicit type annotation.",
+            ],
+        }
+
+        # Log what we're feeding back
+        log_detail(f"Regeneration context: {len(unique_errors)} error patterns from previous attempt")
+        for i, err in enumerate(unique_errors[:5], 1):
+            log_detail(f"  error {i}: {err[:150]}")
+        if reviewer_verdict.get("reasoning"):
+            log_detail(f"  reviewer reasoning: {reviewer_verdict['reasoning'][:200]}")
+
+    user = json.dumps(user_payload)
 
     raw, stats = dmr_chat_raw(
         model=CODER_MODEL, system=system, user=user,
-        max_tokens=32000, temperature=0.2,
+        max_tokens=65536, temperature=0.2,
         label="generate-all",
     )
     elapsed = time.monotonic() - t0
     log_detail(f"Model response received in {elapsed:.1f}s")
 
-    files = parse_fenced_files(raw)
-    if not files:
+    generated_files = parse_fenced_files(raw)
+    if not generated_files:
         log_detail(f"No fenced files found. Response start: {raw[:500]!r}")
         raise RuntimeError("Generate step returned no files in fence format")
 
-    log_detail(f"Generated {len(files)} files")
+    log_detail(f"Generated {len(generated_files)} files")
+
+    # Merge with scaffold: scaffold provides the base, generated files overlay
+    if has_scaffold:
+        merged = dict(scaffold_files)
+
+        # Handle EXTRA_DEPS.json: merge into scaffold package.json
+        extra_deps_raw = generated_files.pop("EXTRA_DEPS.json", None)
+        if extra_deps_raw:
+            try:
+                extra = json.loads(extra_deps_raw)
+                pkg = json.loads(merged.get("package.json", "{}"))
+                for dep, ver in extra.get("dependencies", {}).items():
+                    pkg.setdefault("dependencies", {})[dep] = ver
+                for dep, ver in extra.get("devDependencies", {}).items():
+                    pkg.setdefault("devDependencies", {})[dep] = ver
+                merged["package.json"] = json.dumps(pkg, indent=2)
+                log_detail(f"Merged EXTRA_DEPS: {list(extra.get('dependencies', {}).keys())}")
+            except (json.JSONDecodeError, AttributeError) as e:
+                log_detail(f"WARNING: could not parse EXTRA_DEPS.json: {e}")
+
+        # Overlay generated files (skip config files the scaffold owns,
+        # unless the coder explicitly replaced them)
+        for path, content in generated_files.items():
+            merged[path] = content
+
+        files = merged
+    else:
+        files = generated_files
 
     # Reconcile imports: ensure every npm package used in source files
     # is listed in package.json dependencies
     files = _reconcile_imports(files)
+
+    # Sanitize known issues before the first build
+    files = _sanitize_generated_files(files)
 
     total_chars = sum(len(c) for c in files.values())
     timings = _record_step(state, "generate", elapsed, stats,
@@ -471,7 +897,7 @@ def write_node(state: FactoryState) -> dict:
         for fname in filenames:
             abs_path = os.path.join(dirpath, fname)
             rel = os.path.relpath(abs_path, project_dir)
-            if rel not in expected and fname != "pnpm-lock.yaml":
+            if rel not in expected and fname not in ("pnpm-lock.yaml", "run.log", "summary.txt"):
                 os.remove(abs_path)
 
     for rel_path, content in files.items():
@@ -497,7 +923,8 @@ def install_node(state: FactoryState) -> dict:
     last_hash = state.get("last_installed_package_json_hash")
 
     node_modules = os.path.join(project_dir, "node_modules")
-    if os.path.isdir(node_modules) and pkg_hash and pkg_hash == last_hash:
+    has_modules = os.path.isdir(node_modules) and os.listdir(node_modules)
+    if has_modules and pkg_hash and pkg_hash == last_hash:
         log_detail("deps already installed, skipping")
         elapsed = time.monotonic() - t0
         timings = _record_step(state, "install", elapsed, skipped=True)
@@ -507,6 +934,59 @@ def install_node(state: FactoryState) -> dict:
         raise RuntimeError("pnpm not found in PATH")
 
     p = _run_cmd(["pnpm", "install"], cwd=project_dir)
+
+    # If install failed due to 404 packages, remove them from package.json
+    # AND strip their imports from source files, then retry
+    files_updated = False
+    if p.returncode != 0 and "ERR_PNPM_FETCH_404" in (p.stdout or ""):
+        bad_pkgs = re.findall(
+            r"ERR_PNPM_FETCH_404.*?registry\.npmjs\.org/([^\s:]+)",
+            p.stdout or "",
+        )
+        if bad_pkgs:
+            files = dict(state.get("files", {}))
+            pkg_json_str = files.get("package.json", "")
+            try:
+                pkg = json.loads(pkg_json_str)
+                deps = pkg.get("dependencies", {})
+                removed = []
+                for raw in bad_pkgs:
+                    pkg_name = raw.replace("%2F", "/")
+                    if pkg_name in deps:
+                        del deps[pkg_name]
+                        removed.append(pkg_name)
+                if removed:
+                    pkg["dependencies"] = deps
+                    new_pkg_json = json.dumps(pkg, indent=2)
+                    files["package.json"] = new_pkg_json
+                    # Write fixed package.json to disk
+                    pkg_path = os.path.join(project_dir, "package.json")
+                    with open(pkg_path, "w", encoding="utf-8") as f:
+                        f.write(new_pkg_json)
+                    # Strip imports of removed packages from source files
+                    for pkg_name in removed:
+                        import_re = re.compile(
+                            rf"^import\s+.*?from\s+['\"](?:{re.escape(pkg_name)})['\"];?\s*\n?",
+                            re.MULTILINE,
+                        )
+                        for fpath in list(files.keys()):
+                            if not fpath.endswith((".ts", ".tsx", ".js", ".jsx")):
+                                continue
+                            new_content = import_re.sub("", files[fpath])
+                            if new_content != files[fpath]:
+                                files[fpath] = new_content
+                                # Write updated source to disk
+                                abs_path = os.path.join(project_dir, fpath)
+                                with open(abs_path, "w", encoding="utf-8") as f:
+                                    f.write(new_content)
+                                log_detail(f"Install fix: stripped import of {pkg_name} from {fpath}")
+                    files_updated = True
+                    log_detail(f"Install fix: removed non-existent packages: {', '.join(removed)}")
+                    # Retry install
+                    p = _run_cmd(["pnpm", "install"], cwd=project_dir)
+            except (json.JSONDecodeError, KeyError):
+                pass
+
     elapsed = time.monotonic() - t0
     if p.returncode != 0:
         timings = _record_step(state, "install", elapsed, ok=False)
@@ -517,10 +997,16 @@ def install_node(state: FactoryState) -> dict:
         }
     log_detail(f"Install completed in {elapsed:.1f}s")
     timings = _record_step(state, "install", elapsed, ok=True)
-    return {
+    result: dict = {
         "last_installed_package_json_hash": pkg_hash or last_hash,
         "step_timings": timings,
     }
+    # If we patched files during install (removed bad packages + their imports),
+    # propagate the updated files dict back to state
+    if files_updated:
+        result["files"] = files
+        result["package_json_hash"] = _hash_text(files["package.json"])
+    return result
 
 
 def build_node(state: FactoryState) -> dict:
@@ -548,13 +1034,26 @@ def build_node(state: FactoryState) -> dict:
     }
 
 
-def _try_mechanical_fix(build_log: str, files: dict[str, str]) -> dict[str, str] | None:
+def _try_mechanical_fix(build_log: str, files: dict[str, str]) -> tuple[dict[str, str], list[str]] | None:
     """Try to fix build errors mechanically without calling the LLM.
 
-    Returns a dict of {path: new_content} for patched files, or None if
-    no mechanical fix applies.
+    Returns (patches, removals) where patches is {path: new_content} and
+    removals is a list of paths to delete from the file map. Returns None
+    if no mechanical fix applies.
     """
     patches: dict[str, str] = {}
+    # Track files to remove from the files dict (renames)
+    removals: list[str] = []
+
+    # --- Fix 0: next.config.ts → next.config.mjs ---
+    if "next.config.ts is not supported" in build_log or "Configuring Next.js via 'next.config.ts'" in build_log:
+        if "next.config.ts" in files and "next.config.mjs" not in files:
+            content = files["next.config.ts"]
+            content = re.sub(r":\s*NextConfig\b", "", content)
+            content = re.sub(r"import\s+type\s*\{[^}]*\}\s*from\s*['\"]next['\"];?\n?", "", content)
+            patches["next.config.mjs"] = content
+            removals.append("next.config.ts")
+            log_detail("Mechanical fix: renamed next.config.ts → next.config.mjs")
 
     # --- Fix 1: missing npm packages ---
     missing_modules = re.findall(
@@ -644,7 +1143,83 @@ def _try_mechanical_fix(build_log: str, files: dict[str, str]) -> dict[str, str]
             patches[norm_path] = content
             log_detail(f"Mechanical fix: added import of {missing_name} from {rel} in {norm_path}")
 
-    return patches if patches else None
+    # --- Fix 3: "Property 'X' does not exist on type '... & SomeProps'" ---
+    # The model generates a component with an incomplete props interface, then
+    # uses props that aren't defined.  Fix: add the missing prop as optional.
+    missing_props = re.findall(
+        r"Property '(\w+)' does not exist on type 'IntrinsicAttributes & (\w+)'",
+        build_log,
+    )
+    if missing_props:
+        # Build index: find which file defines each interface/type
+        _INTERFACE_RE = re.compile(
+            r"(?:export\s+)?(?:interface|type)\s+(\w+)\s*(?:extends\s+[^{]+)?\{",
+        )
+        type_to_file: dict[str, str] = {}
+        for fpath, content in files.items():
+            if not fpath.endswith((".ts", ".tsx")):
+                continue
+            for m in _INTERFACE_RE.finditer(content):
+                type_to_file[m.group(1)] = fpath
+
+        # Also try to infer prop types from the error's assignable-from type
+        # e.g. "Type '{ asChild: true; variant: "secondary"; size: string; }'"
+        prop_types: dict[str, str] = {}
+        type_block = re.search(
+            r"Type '\{([^}]+)\}' is not assignable", build_log,
+        )
+        if type_block:
+            for prop_match in re.finditer(
+                r"(\w+):\s*(?:\"[^\"]*\"|'[^']*'|true|false|\w+)",
+                type_block.group(1),
+            ):
+                pname = prop_match.group(0)
+                # Extract name and value to infer type
+                parts = pname.split(":", 1)
+                if len(parts) == 2:
+                    val = parts[1].strip().strip("\"'")
+                    if val in ("true", "false"):
+                        prop_types[parts[0].strip()] = "boolean"
+                    else:
+                        prop_types[parts[0].strip()] = "string"
+
+        # Group missing props by their target type
+        props_by_type: dict[str, set[str]] = {}
+        for prop_name, type_name in missing_props:
+            props_by_type.setdefault(type_name, set()).add(prop_name)
+
+        for type_name, prop_names in props_by_type.items():
+            if type_name not in type_to_file:
+                continue
+            fpath = type_to_file[type_name]
+            content = patches.get(fpath, files[fpath])
+
+            # Find the interface/type block and add missing props before
+            # the closing brace
+            for prop_name in prop_names:
+                # Skip if already defined
+                if re.search(rf"\b{re.escape(prop_name)}\s*[?:]", content):
+                    continue
+                inferred_type = prop_types.get(prop_name, "string")
+                new_prop = f"  {prop_name}?: {inferred_type};\n"
+
+                # Insert before the closing brace of the interface/type
+                # Find the interface definition, then its closing brace
+                pattern = re.compile(
+                    rf"((?:export\s+)?(?:interface|type)\s+{re.escape(type_name)}\s*"
+                    rf"(?:extends\s+[^{{]+)?\{{[^}}]*?)(}})",
+                    re.DOTALL,
+                )
+                match = pattern.search(content)
+                if match:
+                    content = content[:match.end(1)] + new_prop + content[match.start(2):]
+                    log_detail(f"Mechanical fix: added {prop_name}?: {inferred_type} to {type_name} in {fpath}")
+
+            patches[fpath] = content
+
+    if not patches and not removals:
+        return None
+    return patches, removals
 
 
 def _build_fix_history_text(fix_history: list[dict]) -> str:
@@ -675,11 +1250,14 @@ def fix_node(state: FactoryState) -> dict:
 
     # --- Mechanical fix (reviewer already detected it) ---
     if verdict.get("mechanical"):
-        mechanical_patches = _try_mechanical_fix(build_log, files)
-        if mechanical_patches:
+        result = _try_mechanical_fix(build_log, files)
+        if result:
+            mechanical_patches, removals = result
             patched_files = sorted(mechanical_patches.keys())
             log_detail(f"Mechanical fix patched: {', '.join(patched_files)}")
             merged = dict(files)
+            for r in removals:
+                merged.pop(r, None)
             merged.update(mechanical_patches)
             fix_history.append({
                 "attempt": fix_attempt,
@@ -713,12 +1291,25 @@ def fix_node(state: FactoryState) -> dict:
         "2. To delete a file, use:\n"
         "===DELETE: relative/path.ext===\n\n"
         "3. End with a brief explanation on its own line starting with EXPLANATION:\n\n"
-        "IMPORTANT: Use next.config.mjs (NOT next.config.ts) — Next.js 14 does not support TypeScript config files."
+        "IMPORTANT: Use next.config.mjs (NOT next.config.ts) — Next.js 14 does not support TypeScript config files.\n"
+        "Do NOT import from @radix-ui/* or use shadcn patterns. Use plain HTML elements styled with Tailwind CSS.\n"
+        "KNOWN FIX PATTERNS:\n"
+        "- marked() returns string | Promise<string>. Cast it: `marked(markdown) as string`. "
+        "Do NOT make wrapper functions async just to handle this — cast instead.\n"
+        "- ESLint 'defined but never used': prefix with underscore (`_error`) or remove.\n"
+        "- ESLint 'never reassigned, use const': change `let` to `const`.\n"
+        "- 'X is possibly undefined': add a guard `if (!x) return notFound();` or `if (!x) throw ...` before usage."
     )
 
-    # Send all project files as context — the model has 128k context, use it
+    # Send app-specific project files as context (skip scaffold boilerplate)
+    # Scaffold config files don't need to be in the fix context — they're correct
+    _SKIP_IN_FIX = _SCAFFOLD_ONLY_FILES | {
+        "next-env.d.ts", "README.md", "pnpm-lock.yaml",
+    }
     snapshot_text = ""
     for path in sorted(files.keys()):
+        if path in _SKIP_IN_FIX:
+            continue
         snapshot_text += f"===CURRENT FILE: {path}===\n{files[path]}\n===END CURRENT FILE===\n\n"
 
     history_text = _build_fix_history_text(fix_history)
@@ -756,9 +1347,14 @@ def fix_node(state: FactoryState) -> dict:
 
     patches = parse_fenced_files(raw)
 
-    # Parse deletions
+    # Parse deletions (with guardrails — never delete critical files)
+    _PROTECTED_FILES = {"package.json", "tsconfig.json", "next.config.mjs", "next.config.js"}
     deletion_pattern = re.compile(r"===DELETE:\s*(.+?)\s*===")
-    deletions = deletion_pattern.findall(raw)
+    raw_deletions = deletion_pattern.findall(raw)
+    deletions = [d for d in raw_deletions if d not in _PROTECTED_FILES]
+    blocked = [d for d in raw_deletions if d in _PROTECTED_FILES]
+    if blocked:
+        log_detail(f"Blocked deletion of protected files: {', '.join(blocked)}")
 
     if not patches and not deletions:
         log_detail(f"Fix produced no patches or deletions. Response start: {raw[:500]!r}")
@@ -873,7 +1469,7 @@ def _build_summary(state: FactoryState) -> str:
 def _emit_summary(state: FactoryState) -> None:
     """Print run summary to stdout and write to summary.txt in the project dir."""
     summary = _build_summary(state)
-    print("\n" + summary)
+    tee_print("\n" + summary)
 
     project_dir = state.get("project_dir")
     if project_dir:
@@ -885,11 +1481,13 @@ def _emit_summary(state: FactoryState) -> None:
 
 def done_node(state: FactoryState) -> dict:
     _emit_summary(state)
+    close_log_file()
     return {}
 
 
 def fail_node(state: FactoryState) -> dict:
     _emit_summary(state)
+    close_log_file()
     raise RuntimeError(
         "Failed to reach a successful pnpm build within retry limits.\n\n"
         f"Project dir: {state.get('project_dir')}\n\n"
@@ -918,8 +1516,8 @@ def review_node(state: FactoryState) -> dict:
 
     # Check for mechanical fix first — skip the LLM reviewer entirely
     files = state.get("files", {})
-    mechanical_patches = _try_mechanical_fix(build_log, files)
-    if mechanical_patches:
+    result = _try_mechanical_fix(build_log, files)
+    if result:
         log_detail("Reviewer skipped — mechanical fix available")
         elapsed = time.monotonic() - t0
         timings = _record_step(state, "review", elapsed, skipped="mechanical")
@@ -929,6 +1527,29 @@ def review_node(state: FactoryState) -> dict:
                 "guidance": "Mechanical fix available — apply automatically.",
                 "reasoning": "Deterministic pattern match.",
                 "mechanical": True,
+            },
+            "step_timings": timings,
+        }
+
+    # --- Spin detection: if the same file has been patched 2+ times,
+    #     the fix loop isn't making progress ---
+    patch_counts: dict[str, int] = {}
+    for entry in fix_history:
+        for p in entry.get("patches", []):
+            if not p.startswith("DELETE:"):
+                patch_counts[p] = patch_counts.get(p, 0) + 1
+    repeat_patches = {f: n for f, n in patch_counts.items() if n >= 2}
+
+    if repeat_patches and gen_attempt < MAX_GENERATE_ATTEMPTS:
+        repeat_summary = ", ".join(f"{f} ({n}x)" for f, n in repeat_patches.items())
+        log_detail(f"Spin detected: repeated patches to {repeat_summary} — forcing regenerate")
+        elapsed = time.monotonic() - t0
+        timings = _record_step(state, "review", elapsed, spin_detected=True)
+        return {
+            "review_verdict": {
+                "action": "regenerate",
+                "reasoning": f"Fix loop is spinning: {repeat_summary} patched repeatedly without progress.",
+                "guidance": "",
             },
             "step_timings": timings,
         }
@@ -1030,13 +1651,16 @@ def decide_after_review(state: FactoryState) -> str:
 def build_factory_graph():
     """Build the full factory pipeline graph.
 
-    Pipeline: policy -> manifest -> generate -> write -> install -> build
+    Pipeline: policy -> scaffold -> manifest -> review_manifest -> generate
+              -> write -> install -> build
     with fix loop (mechanical + LLM) and regeneration fallback.
     """
     g = StateGraph(FactoryState)
 
     g.add_node("policy", policy_node)
+    g.add_node("scaffold", scaffold_node)
     g.add_node("manifest", manifest_node)
+    g.add_node("review_manifest", review_manifest_node)
     g.add_node("generate", generate_node)
     g.add_node("write", write_node)
     g.add_node("install", install_node)
@@ -1047,8 +1671,10 @@ def build_factory_graph():
     g.add_node("fail", fail_node)
 
     g.add_edge(START, "policy")
-    g.add_edge("policy", "manifest")
-    g.add_edge("manifest", "generate")
+    g.add_edge("policy", "scaffold")
+    g.add_edge("scaffold", "manifest")
+    g.add_edge("manifest", "review_manifest")
+    g.add_edge("review_manifest", "generate")
 
     g.add_edge("generate", "write")
     g.add_edge("write", "install")

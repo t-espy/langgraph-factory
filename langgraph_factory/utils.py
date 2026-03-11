@@ -1,20 +1,60 @@
 """Shared utilities for langgraph-factory pipelines."""
 
 import json
+import os
 import re
+import threading
 from datetime import datetime
+
+# Module-level log file handle — set via init_log_file()
+_log_file = None
+_log_lock = threading.Lock()
+
+
+def init_log_file(project_dir: str) -> None:
+    """Open a log file in the project output directory.
+
+    Called once when the project_dir is known. All subsequent log_step,
+    log_detail, and tee_print calls will write to this file in addition
+    to stdout.
+    """
+    global _log_file
+    os.makedirs(project_dir, exist_ok=True)
+    log_path = os.path.join(project_dir, "run.log")
+    with _log_lock:
+        if _log_file is not None:
+            _log_file.close()
+        _log_file = open(log_path, "w", encoding="utf-8")
+
+
+def close_log_file() -> None:
+    """Close the log file if open."""
+    global _log_file
+    with _log_lock:
+        if _log_file is not None:
+            _log_file.close()
+            _log_file = None
+
+
+def tee_print(message: str) -> None:
+    """Print to stdout and write to the log file if open."""
+    print(message, flush=True)
+    with _log_lock:
+        if _log_file is not None:
+            _log_file.write(message + "\n")
+            _log_file.flush()
 
 
 def log_step(message: str) -> None:
     """Log a high-level pipeline step."""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp}] [progress] {message}")
+    tee_print(f"[{timestamp}] [progress] {message}")
 
 
 def log_detail(message: str) -> None:
     """Log implementation details within a step."""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp}] [detail] {message}")
+    tee_print(f"[{timestamp}] [detail] {message}")
 
 
 def _strip_thinking(text: str) -> str:
@@ -166,6 +206,11 @@ def parse_fenced_files(text: str) -> dict[str, str]:
             content = content[:-1]
         # Strip any leaked delimiters from content (model sometimes nests them)
         content = re.sub(r"^===(?:FILE|DELETE|END FILE|CURRENT FILE|END CURRENT FILE):?.*===\n?", "", content, flags=re.MULTILINE)
+        # Strip markdown code fences the model sometimes wraps inside ===FILE=== blocks
+        # e.g. ```tsx\n...\n``` or ```typescript\n...\n```
+        # Match any ``` with an optional language identifier at the very start
+        content = re.sub(r"^```\w*\s*\n", "", content)
+        content = re.sub(r"\n```\s*$", "", content)
         files[path] = content
 
     return files
