@@ -157,4 +157,29 @@ Things worth studying:
 - How the scaffold node anchors generation on a known-good starting point
 - How failure context flows back into regeneration prompts
 
-The hardware used for development was an NVIDIA DGX Spark (GB10 GPU, 128GB unified RAM) running Docker Model Runner. The models are large — qwen3-coder is 80B parameters (~45GB Q4) and gpt-oss is 20B (~11GB Q4) — so you need substantial GPU memory to run both. The pipeline just talks to an OpenAI-compatible HTTP endpoint, so you can swap in different models or backends (Ollama, LM Studio, etc.) by pointing `DMR_BASE_URL` at it in `config.py`.
+The pipeline just talks to an OpenAI-compatible HTTP endpoint, so you can swap in different models or backends (Ollama, LM Studio, etc.) by pointing `DMR_BASE_URL` at it in `config.py`.
+
+## Hardware and economics
+
+### What we ran on
+
+Development hardware was an NVIDIA DGX Spark (GB10 GPU, 128GB unified RAM) running Docker Model Runner. Observed throughput:
+
+| Model | Parameters | Size (Q4) | tok/s |
+|-------|-----------|-----------|-------|
+| qwen3-coder | 80B | 45 GB | 40-44 |
+| gpt-oss | 20B | 11 GB | 9-35 |
+
+A typical successful run produces ~6,000 tokens across 4-6 LLM calls and completes in 4-5 minutes. Runs that need a fix cycle add ~1,000-4,000 tokens and 30-120 seconds.
+
+### Cost comparison
+
+This pipeline is token-heavy — a single run can consume 6,000-40,000+ tokens across multiple LLM calls, including retries and regenerations. That changes the economics compared to one-shot prompting.
+
+**Pay-per-token (cloud API):** Using a comparable commercial model at ~$3/M input + ~$15/M output tokens, a clean 6K-token run costs roughly $0.05-0.10. But runs that hit regeneration (30K+ tokens) can reach $0.50-1.00+, and you'll have many of those while iterating on prompts and recovery logic. During development of this pipeline, we ran hundreds of generations — at cloud rates that adds up fast.
+
+**Rent a GPU (vast.ai, RunPod, etc.):** An 80GB A100 rents for roughly $1-2/hr. You get unlimited tokens at whatever speed the hardware delivers. A 5-minute run costs ~$0.10-0.15 in GPU time regardless of token count, and regenerations are free. For iterative development work — where you're running the pipeline repeatedly to tune prompts and fix recovery logic — this is substantially cheaper than per-token pricing.
+
+**Own the hardware:** The DGX Spark used here lists at ~$3,999. At $1.50/hr cloud GPU rates, it pays for itself after ~2,700 hours of usage. If you're running local models regularly, the amortized cost approaches zero.
+
+The broader point: pipelines like this generate a lot of tokens that never reach a user — reviewer reasoning, failed generations, fix attempts, regeneration context. Per-token pricing charges you for all of that. Local or rented GPU gives you a flat rate to experiment freely.
