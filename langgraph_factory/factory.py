@@ -15,12 +15,14 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from typing import TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
 from langgraph_factory.config import (
+    BUILD_TIMEOUT,
     CODER_MODEL,
     FOREMAN_MODEL,
     MAX_FIX_ATTEMPTS,
@@ -589,6 +591,29 @@ def _sanitize_generated_files(files: dict[str, str]) -> dict[str, str]:
 
         log_detail(f"Sanitize: injected missing root layout at {layout_path}")
 
+    # --- Fix: missing "use client" directive ---
+    # Components that use event handlers (onClick, onChange, onSubmit, etc.)
+    # must have "use client" at the top of the file in Next.js App Router.
+    _EVENT_HANDLER_RE = re.compile(
+        r"""\b(?:onClick|onChange|onSubmit|onBlur|onFocus|onInput|onKeyDown"""
+        r"""|onKeyUp|onMouseDown|onMouseUp|onDragStart|onDrop)\s*[={]""",
+    )
+    _HOOK_RE = re.compile(
+        r"""\b(?:useState|useEffect|useRef|useCallback|useMemo|useReducer"""
+        r"""|useContext|useFormState|useFormStatus|useRouter|useSearchParams"""
+        r"""|usePathname)\s*[\(<]""",
+    )
+    for fpath, content in list(files.items()):
+        if not fpath.endswith((".tsx", ".jsx")):
+            continue
+        # Already has "use client"
+        if content.lstrip().startswith('"use client"') or content.lstrip().startswith("'use client'"):
+            continue
+        # Check for event handlers or React hooks that require client components
+        if _EVENT_HANDLER_RE.search(content) or _HOOK_RE.search(content):
+            files[fpath] = '"use client";\n\n' + content
+            log_detail(f"Sanitize: added 'use client' to {fpath} (has event handlers/hooks)")
+
     return files
 
 
@@ -730,6 +755,10 @@ def generate_node(state: FactoryState) -> dict:
         "Remove unused imports and variables.\n"
         "- Next.js 14 params: In Next.js 14, route params are a plain object — access `params.id` directly. "
         "Do NOT use `React.use(params)` or `use(params.id)` — that is a Next.js 15 pattern and will cause type errors.\n"
+        "- 'use client' directive: Any component that uses event handlers (onClick, onChange, onSubmit) "
+        "or React hooks (useState, useEffect, useRef, useRouter, useSearchParams) MUST have "
+        '`"use client";` as the VERY FIRST line of the file. Without it, Next.js treats it as a '
+        "server component and the build will fail with 'Event handlers cannot be passed to Client Component props'.\n"
         "- ESLint no-explicit-any: NEVER use `any` as a type. Use specific types: "
         "`React.FormEvent<HTMLFormElement>` for form submit handlers, "
         "`React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>` for input handlers, "
@@ -1038,7 +1067,7 @@ def install_node(state: FactoryState) -> dict:
 
 
 def build_node(state: FactoryState) -> dict:
-    """Run pnpm build."""
+    """Run pnpm build with streaming output and timeout."""
     log_step("Run pnpm build")
     t0 = time.monotonic()
     project_dir = _require_project_dir(state)
@@ -1047,17 +1076,53 @@ def build_node(state: FactoryState) -> dict:
     if shutil.which("pnpm") is None:
         raise RuntimeError("pnpm not found in PATH")
 
-    p = _run_cmd(["pnpm", "build"], cwd=project_dir)
+    # Stream build output line-by-line so the user sees progress.
+    # Use a thread to read stdout while enforcing a wall-clock timeout.
+    output_lines: list[str] = []
+    timed_out = False
+
+    proc = subprocess.Popen(
+        ["pnpm", "build"], cwd=project_dir,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+    def _read_output():
+        assert proc.stdout is not None
+        for raw_line in proc.stdout:
+            line = raw_line.rstrip("\n")
+            output_lines.append(line)
+            stripped = line.strip()
+            # Show build progress, skip stack traces and empty lines
+            if stripped and not stripped.startswith("at ") and not stripped.startswith("at Object."):
+                log_detail(f"  build: {stripped}")
+
+    reader = threading.Thread(target=_read_output, daemon=True)
+    reader.start()
+    try:
+        proc.wait(timeout=BUILD_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        timed_out = True
+        output_lines.append(f"\n*** BUILD TIMED OUT after {BUILD_TIMEOUT}s ***")
+        log_detail(f"Build timed out after {BUILD_TIMEOUT}s")
+    reader.join(timeout=5)
+    returncode = proc.returncode
+
     elapsed = time.monotonic() - t0
-    ok = p.returncode == 0
+    build_output = "\n".join(output_lines)
+    ok = returncode == 0
+
     if ok:
         log_detail(f"Build succeeded in {elapsed:.1f}s")
-    else:
-        _log_build_failure(p.stdout or "", build_attempt, state.get("last_patched_files", []))
+    elif not timed_out:
+        _log_build_failure(build_output, build_attempt, state.get("last_patched_files", []))
         log_detail(f"Build failed in {elapsed:.1f}s")
+
     timings = _record_step(state, "build", elapsed, ok=ok, attempt=build_attempt)
     return {
-        "last_build_ok": ok, "last_build_log": p.stdout,
+        "last_build_ok": ok, "last_build_log": build_output,
         "build_attempt": build_attempt, "step_timings": timings,
     }
 
@@ -1332,6 +1397,29 @@ def _try_mechanical_fix(build_log: str, files: dict[str, str]) -> tuple[dict[str
                 patches[fpath] = content
                 log_detail(f"Mechanical fix: removed unused imports in {fpath}")
 
+    # --- Fix 6: missing "use client" directive ---
+    # "Event handlers cannot be passed to Client Component props" means a
+    # server component uses onClick/onChange/onSubmit/etc. Fix: add "use client".
+    if "Event handlers cannot be passed to Client Component props" in build_log:
+        _MF_EVENT_HANDLER_RE = re.compile(
+            r"""\b(?:onClick|onChange|onSubmit|onBlur|onFocus|onInput|onKeyDown"""
+            r"""|onKeyUp|onMouseDown|onMouseUp|onDragStart|onDrop)\s*[={]""",
+        )
+        _MF_HOOK_RE = re.compile(
+            r"""\b(?:useState|useEffect|useRef|useCallback|useMemo|useReducer"""
+            r"""|useContext|useFormState|useFormStatus|useRouter|useSearchParams"""
+            r"""|usePathname)\s*[\(<]""",
+        )
+        for fpath, content in files.items():
+            if not fpath.endswith((".tsx", ".jsx")):
+                continue
+            effective = patches.get(fpath, content)
+            if effective.lstrip().startswith('"use client"') or effective.lstrip().startswith("'use client'"):
+                continue
+            if _MF_EVENT_HANDLER_RE.search(effective) or _MF_HOOK_RE.search(effective):
+                patches[fpath] = '"use client";\n\n' + effective
+                log_detail(f"Mechanical fix: added 'use client' to {fpath}")
+
     if not patches and not removals:
         return None
     return patches, removals
@@ -1414,6 +1502,8 @@ def fix_node(state: FactoryState) -> dict:
         "- ESLint 'defined but never used': remove the catch parameter entirely — use `catch {` instead of `catch (error)`. "
         "For unused imports, delete the import line.\n"
         "- ESLint 'never reassigned, use const': change `let` to `const`.\n"
+        "- 'Event handlers cannot be passed to Client Component props': add `\"use client\";` as the first line "
+        "of every file that uses onClick, onChange, onSubmit, useState, useEffect, useRef, useRouter, etc.\n"
         "- 'X is possibly undefined': add a guard `if (!x) return notFound();` or `if (!x) throw ...` before usage."
     )
 

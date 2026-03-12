@@ -20,3 +20,4 @@ OUTPUT_DIR = RUNS_DIR  # default; examples override with timestamped subdirs
 MAX_GENERATE_ATTEMPTS = int(os.environ.get("MAX_GENERATE_ATTEMPTS", "2"))
 MAX_FIX_ATTEMPTS = int(os.environ.get("MAX_FIX_ATTEMPTS", "4"))
 LINT_MAX_LOOPS = int(os.environ.get("LINT_MAX_LOOPS", "10"))
+BUILD_TIMEOUT = int(os.environ.get("BUILD_TIMEOUT", "120"))  # seconds

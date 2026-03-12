@@ -10,7 +10,7 @@ The pipeline generates complete Next.js App Router projects from a natural-langu
 - **Mechanical error recovery** — common build failures (missing packages, unused imports, config file issues) are fixed deterministically without burning LLM calls
 - **Failure-informed regeneration** — when fixes aren't enough, the pipeline regenerates with error context from the failed attempt
 
-Everything runs locally on [Docker Model Runner](https://docs.docker.com/model-runner/) — no API keys, no cloud dependencies, no per-token costs.
+Everything runs locally on [Docker Model Runner](https://docs.docker.com/model-runner/) — no API keys, no cloud dependencies, no per-token costs. It's a step towards bringing the build-test-fix discipline of CI/CD to LLM code generation.
 
 ## How it works
 
@@ -133,6 +133,7 @@ All config is via environment variables — see `config.py` for defaults:
 | `CODER_MODEL` | `docker.io/ai/qwen3-coder-next:latest` | Code generation + fixes |
 | `MAX_GENERATE_ATTEMPTS` | `2` | Full regeneration budget |
 | `MAX_FIX_ATTEMPTS` | `4` | Fix cycles per generation attempt |
+| `BUILD_TIMEOUT` | `120` | Seconds before `pnpm build` is killed |
 
 ## Project structure
 

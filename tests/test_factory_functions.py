@@ -145,6 +145,89 @@ class TestSanitizeGeneratedFiles:
         _sanitize_generated_files(files)
         assert files == original
 
+    def test_adds_use_client_for_onclick(self):
+        files = {
+            "src/app/products/page.tsx": (
+                "export default function Products() {\n"
+                "  return <button onClick={() => {}}>Click</button>;\n"
+                "}\n"
+            ),
+            "src/app/layout.tsx": "export default function Layout({ children }) { return children; }",
+        }
+        result = _sanitize_generated_files(files)
+        assert result["src/app/products/page.tsx"].startswith('"use client"')
+
+    def test_adds_use_client_for_usestate(self):
+        files = {
+            "src/app/products/page.tsx": (
+                'import { useState } from "react";\n'
+                "export default function Products() {\n"
+                "  const [x, setX] = useState(0);\n"
+                "  return <div>{x}</div>;\n"
+                "}\n"
+            ),
+            "src/app/layout.tsx": "export default function Layout({ children }) { return children; }",
+        }
+        result = _sanitize_generated_files(files)
+        assert result["src/app/products/page.tsx"].startswith('"use client"')
+
+    def test_adds_use_client_for_onsubmit(self):
+        files = {
+            "src/app/products/new/page.tsx": (
+                "export default function NewProduct() {\n"
+                "  return <form onSubmit={handleSubmit}><input /></form>;\n"
+                "}\n"
+            ),
+            "src/app/layout.tsx": "layout",
+        }
+        result = _sanitize_generated_files(files)
+        assert result["src/app/products/new/page.tsx"].startswith('"use client"')
+
+    def test_no_use_client_if_already_present(self):
+        content = (
+            '"use client";\n\n'
+            "export default function Page() {\n"
+            "  return <button onClick={() => {}}>Click</button>;\n"
+            "}\n"
+        )
+        files = {
+            "src/app/page.tsx": content,
+            "src/app/layout.tsx": "layout",
+        }
+        result = _sanitize_generated_files(files)
+        # Should not double-add
+        assert result["src/app/page.tsx"].count('"use client"') == 1
+
+    def test_no_use_client_for_server_component(self):
+        files = {
+            "src/app/page.tsx": "export default function Page() { return <div>Hello</div>; }",
+            "src/app/layout.tsx": "layout",
+        }
+        result = _sanitize_generated_files(files)
+        assert '"use client"' not in result["src/app/page.tsx"]
+
+    def test_no_use_client_for_non_tsx(self):
+        files = {
+            "src/lib/store.ts": "const onClick = () => {};",
+            "src/app/layout.tsx": "layout",
+        }
+        result = _sanitize_generated_files(files)
+        assert '"use client"' not in result["src/lib/store.ts"]
+
+    def test_adds_use_client_for_userouter(self):
+        files = {
+            "src/app/products/page.tsx": (
+                'import { useRouter } from "next/navigation";\n'
+                "export default function Page() {\n"
+                "  const router = useRouter();\n"
+                "  return <div>page</div>;\n"
+                "}\n"
+            ),
+            "src/app/layout.tsx": "layout",
+        }
+        result = _sanitize_generated_files(files)
+        assert result["src/app/products/page.tsx"].startswith('"use client"')
+
 
 # ---------------------------------------------------------------------------
 # _extract_npm_packages
@@ -364,3 +447,61 @@ class TestTryMechanicalFix:
         patches, _ = result
         assert "src/components/button.tsx" in patches
         assert "variant?" in patches["src/components/button.tsx"]
+
+    def test_use_client_fix_on_event_handler_error(self):
+        build_log = (
+            "Error: Event handlers cannot be passed to Client Component props.\n"
+            "  {type: \"submit\", className: ..., onClick: function onClick, children: ...}\n"
+            "                                            ^^^^^^^^^^^^^^^^\n"
+        )
+        files = {
+            "src/app/products/page.tsx": (
+                "export default function Products() {\n"
+                "  return <button onClick={() => {}}>Click</button>;\n"
+                "}\n"
+            ),
+            "src/app/page.tsx": (
+                "export default function Home() { return <div>Home</div>; }\n"
+            ),
+        }
+        result = _try_mechanical_fix(build_log, files)
+        assert result is not None
+        patches, _ = result
+        assert "src/app/products/page.tsx" in patches
+        assert patches["src/app/products/page.tsx"].startswith('"use client"')
+        # Server-only component should NOT be patched
+        assert "src/app/page.tsx" not in patches
+
+    def test_use_client_fix_skips_already_client(self):
+        build_log = (
+            "Error: Event handlers cannot be passed to Client Component props.\n"
+        )
+        files = {
+            "src/app/products/page.tsx": (
+                '"use client";\n\n'
+                "export default function Products() {\n"
+                "  return <button onClick={() => {}}>Click</button>;\n"
+                "}\n"
+            ),
+        }
+        result = _try_mechanical_fix(build_log, files)
+        # No patches needed — already has "use client"
+        assert result is None
+
+    def test_use_client_fix_for_hooks(self):
+        build_log = (
+            "Error: Event handlers cannot be passed to Client Component props.\n"
+        )
+        files = {
+            "src/app/products/page.tsx": (
+                'import { useState } from "react";\n'
+                "export default function Products() {\n"
+                "  const [items, setItems] = useState([]);\n"
+                "  return <div>{items.length}</div>;\n"
+                "}\n"
+            ),
+        }
+        result = _try_mechanical_fix(build_log, files)
+        assert result is not None
+        patches, _ = result
+        assert patches["src/app/products/page.tsx"].startswith('"use client"')
