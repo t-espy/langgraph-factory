@@ -104,7 +104,7 @@ curl http://localhost:12434/engines/v1/models
 ### Install and run
 
 ```bash
-git clone <this-repo> langgraph-factory
+git clone https://github.com/t-espy/langgraph-factory.git
 cd langgraph-factory
 pip install -e .
 ```
