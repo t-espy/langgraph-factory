@@ -41,7 +41,7 @@ for spec in "$EXAMPLES_DIR"/*.py; do
     echo "  SPEC: $name"
     echo "================================================================"
 
-    if python "$spec"; then
+    if python3 "$spec"; then
         passed=$((passed + 1))
         results+=("PASS  $name")
     else
