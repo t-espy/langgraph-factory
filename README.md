@@ -40,8 +40,8 @@ Each box is a LangGraph node. The pipeline is defined in `factory.py` using `Sta
 
 The pipeline has several layers that handle failures, applied in order:
 
-1. **Post-generate sanitizer** — deterministic fixes before the first build (next.config.ts rename, missing root layout, import reconciliation)
-2. **Mechanical fixes** — pattern-matched build errors fixed without LLM calls (missing npm packages, unused imports/variables, incomplete prop interfaces)
+1. **Post-generate sanitizer** — deterministic fixes before the first build (next.config.ts rename, missing root layout, missing `"use client"` directives, import reconciliation)
+2. **Mechanical fixes** — pattern-matched build errors fixed without LLM calls (missing npm packages, unused imports/variables, incomplete prop interfaces, missing `"use client"` directives)
 3. **Reviewer-guided LLM fixes** — foreman diagnoses the error, coder applies the fix
 4. **Spin detection** — if the same file is patched 2+ times, forces regeneration
 5. **Failure-informed regeneration** — error patterns from failed attempts are fed into the next generation prompt
@@ -78,7 +78,7 @@ Full sample output: [`examples/sample_output_blog.txt`](examples/sample_output_b
 ### Prerequisites
 
 - **Docker Model Runner** with GPU support (or any OpenAI-compatible endpoint at `localhost:12434`)
-- **Node.js** and **pnpm**
+- **Node.js 18+** (includes `npx`, used by the scaffold step) and **pnpm**
 - **Python 3.12+**
 
 Install Docker Model Runner with GPU support and pull the models:
@@ -106,6 +106,8 @@ curl http://localhost:12434/engines/v1/models
 ```bash
 git clone https://github.com/t-espy/langgraph-factory.git
 cd langgraph-factory
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -e .
 ```
 
@@ -120,6 +122,13 @@ See `examples/` for complete specs. Run all of them:
 
 ```bash
 ./run_all_specs.sh
+```
+
+To run the unit tests:
+
+```bash
+pip install -e ".[dev]"
+pytest
 ```
 
 ### Configuration
@@ -149,8 +158,9 @@ examples/
 ├── crud_products.py          # Products CRUD spec
 └── sample_output_blog.txt    # What a successful run looks like
 tests/
-├── test_factory_functions.py # Unit tests for recovery/validation logic
-└── test_utils.py             # Unit tests for parsing and extraction
+├── test_factory_functions.py  # Unit tests for recovery/validation logic
+├── test_generate_only.py      # Manual integration test (requires running LLMs)
+└── test_utils.py              # Unit tests for parsing and extraction
 run_all_specs.sh              # Run all example specs and collect results
 ```
 

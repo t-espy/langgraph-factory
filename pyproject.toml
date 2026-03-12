@@ -13,6 +13,12 @@ dependencies = [
 [tool.setuptools.packages.find]
 include = ["langgraph_factory*"]
 
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py312"
