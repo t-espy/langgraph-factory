@@ -81,11 +81,18 @@ Full sample output: [`examples/sample_output_blog.txt`](examples/sample_output_b
 - **Node.js** and **pnpm**
 - **Python 3.12+**
 
-Pull the models:
+Install Docker Model Runner with GPU support and pull the models:
 ```bash
+# First-time setup (or reinstall to enable GPU)
+docker model install-runner --gpu cuda
+# If already installed without GPU, reinstall:
+# docker model uninstall-runner && docker model install-runner --gpu cuda
+
 docker model pull ai/gpt-oss:20B
 docker model pull ai/qwen3-coder-next:latest
 ```
+
+The `--gpu cuda` flag ensures models run on your NVIDIA GPU instead of CPU. Without it, inference will be orders of magnitude slower.
 
 Verify your setup:
 ```bash
