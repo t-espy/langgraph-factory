@@ -11,9 +11,6 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 EXAMPLES_DIR="$SCRIPT_DIR/examples"
 RUNS_DIR="${FACTORY_RUNS_DIR:-$SCRIPT_DIR/runs}"
 
-# Skip the MVP example (different pipeline)
-SKIP_PATTERNS="mvp"
-
 passed=0
 failed=0
 skipped=0
@@ -21,13 +18,6 @@ results=()
 
 for spec in "$EXAMPLES_DIR"/*.py; do
     name="$(basename "$spec" .py)"
-
-    # Skip MVP examples
-    if [[ "$name" == *$SKIP_PATTERNS* ]]; then
-        skipped=$((skipped + 1))
-        results+=("SKIP  $name")
-        continue
-    fi
 
     # If a filter was given, only run matching specs
     if [[ $# -gt 0 ]] && [[ "$name" != *"$1"* ]]; then

@@ -1,7 +1,7 @@
-"""Full factory pipeline: policy -> manifest -> generate -> build -> fix loop.
+"""Factory pipeline: policy -> scaffold -> manifest -> generate -> build -> fix loop.
 
-Evolution of the MVP pipeline. Adds:
 - Architecture policy step (foreman produces a contract before generation)
+- Scaffold step (create-next-app provides known-good config files)
 - Manifest step (plan file list with validation/retry before generating)
 - Build-fix loop with mechanical error classification and LLM fallback
 - Package.json hash tracking (skip reinstall when deps unchanged)
